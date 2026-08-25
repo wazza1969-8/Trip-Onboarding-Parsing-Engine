@@ -132,25 +132,55 @@ def fetch_request(request_id: str, db_path: Path = DB_PATH):
 # ---------------------------------------------------------------------------
 # Parsing bridge
 # ---------------------------------------------------------------------------
+def _get_secret(secrets_getter, key: str):
+    if secrets_getter is not None:
+        try:
+            val = secrets_getter().get(key)
+            if val:
+                return val
+        except Exception:
+            pass
+    return os.environ.get(key)
+
+
 def get_anthropic_client(secrets_getter=None):
     """secrets_getter: optional callable returning a dict-like of secrets
     (e.g. st.secrets), kept as an injectable dependency so this stays
-    testable without importing streamlit here."""
+    testable without importing streamlit here.
+
+    Supports two auth paths, tried in this order:
+      1. Direct Anthropic Console key (ANTHROPIC_API_KEY, starts with
+         sk-ant-) -> talks to api.anthropic.com directly.
+      2. AWS Bedrock (AWS_BEARER_TOKEN_BEDROCK + AWS_REGION) -> talks to
+         Bedrock's Anthropic-compatible endpoint instead. Enterprise
+         accounts that provision Claude access through AWS rather than
+         a standalone Anthropic Console account will use this path.
+         Optionally set BEDROCK_MODEL_ID if the default model ID isn't
+         enabled for your account -- check the Bedrock console's model
+         access page for the exact ID your account can call.
+
+    Returns (client, model) -- always pass `model` through to
+    pe.extract_page() rather than relying on parsing_engine.py's default,
+    since Bedrock model IDs look nothing like the direct-API model name.
+    """
     import anthropic
 
-    api_key = None
-    if secrets_getter is not None:
-        try:
-            api_key = secrets_getter().get("ANTHROPIC_API_KEY")
-        except Exception:
-            pass
-    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not configured. Set it as an environment variable, "
-            "or add it under App settings -> Secrets if deployed on Streamlit Community Cloud."
-        )
-    return anthropic.Anthropic(api_key=api_key)
+    api_key = _get_secret(secrets_getter, "ANTHROPIC_API_KEY")
+    if api_key:
+        return anthropic.Anthropic(api_key=api_key), pe.MODEL
+
+    bedrock_token = _get_secret(secrets_getter, "AWS_BEARER_TOKEN_BEDROCK")
+    if bedrock_token:
+        region = _get_secret(secrets_getter, "AWS_REGION") or "us-east-1"
+        model = _get_secret(secrets_getter, "BEDROCK_MODEL_ID") or f"us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        client = anthropic.AnthropicBedrock(aws_region=region, api_key=bedrock_token)
+        return client, model
+
+    raise RuntimeError(
+        "No API credentials configured. Set ANTHROPIC_API_KEY (direct Anthropic "
+        "Console key), or AWS_BEARER_TOKEN_BEDROCK + AWS_REGION (AWS Bedrock key), "
+        "under App settings -> Secrets."
+    )
 
 
 def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secrets_getter=None, db_path: Path = DB_PATH) -> None:
@@ -159,7 +189,7 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
     progress_callback(fraction: float, text: str), if given, is called
     after each page is read."""
     try:
-        client = get_anthropic_client(secrets_getter)
+        client, model = get_anthropic_client(secrets_getter)
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = Path(tmp) / "onboarding.pdf"
             pdf_path.write_bytes(pdf_bytes)
@@ -170,7 +200,7 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
             for i, png in enumerate(pages, start=1):
                 if progress_callback is not None:
                     progress_callback(i / len(pages), f"Reading page {i} of {len(pages)}...")
-                result = pe.extract_page(png, client)
+                result = pe.extract_page(png, client, model=model)
                 for section in result.get("sections", []):
                     section["page"] = i
                     sections.append(section)
