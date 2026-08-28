@@ -49,12 +49,10 @@ import streamlit as st
 
 import backend
 
-SALESPEOPLE = [
-    "Jane Smith",
-    "John Doe",
-    "Alex Johnson",
-    "Morgan Lee",
-]
+# The salesperson list itself now lives in the database (backend.py's
+# salespeople table) so it can be edited from the UI below -- see the
+# "Manage salesperson list" expander. backend.DEFAULT_SALESPEOPLE is only
+# the one-time seed for a brand-new database.
 
 PAYMENT_METHODS = ["Credit Card", "Ok to Invoice"]
 MAX_ACCT_NBR_LEN = 20
@@ -71,7 +69,45 @@ with tab_new:
     # Amount/Notes fields wouldn't appear until after clicking Submit.
     # Outside a form, selecting "Ok to Invoice" triggers an immediate
     # rerun, and these fields open up right away as required.
-    salesperson = st.selectbox("Salesperson", SALESPEOPLE, key="salesperson")
+    salespeople = backend.list_salespeople()
+
+    if not salespeople:
+        st.warning("No salespeople configured yet. Add one below before submitting a request.")
+        salesperson = None
+    else:
+        salesperson = st.selectbox("Salesperson", salespeople, key="salesperson")
+
+    with st.expander("Manage salesperson list"):
+        st.caption("Changes apply immediately for everyone using this app.")
+
+        st.markdown("**Add**")
+        new_name = st.text_input("New salesperson name", key="new_salesperson_name")
+        if st.button("Add", key="add_salesperson_btn"):
+            try:
+                backend.add_salesperson(new_name)
+                st.toast(f"Added '{new_name.strip()}'.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+        if salespeople:
+            st.markdown("**Rename**")
+            rename_target = st.selectbox("Salesperson", salespeople, key="rename_salesperson_select")
+            rename_new_name = st.text_input("New name", key="rename_salesperson_new_name")
+            if st.button("Save rename", key="save_rename_btn"):
+                try:
+                    backend.update_salesperson(rename_target, rename_new_name)
+                    st.toast(f"Renamed '{rename_target}' to '{rename_new_name.strip()}'.")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+            st.markdown("**Delete**")
+            delete_target = st.selectbox("Salesperson", salespeople, key="delete_salesperson_select")
+            if st.button("Delete", key="delete_salesperson_btn"):
+                backend.delete_salesperson(delete_target)
+                st.toast(f"Deleted '{delete_target}'.")
+                st.rerun()
 
     acct_nbr = st.text_input(
         "Jeppesen Acct Nbr:",
@@ -103,6 +139,8 @@ with tab_new:
 
     if submitted:
         errors = []
+        if salesperson is None:
+            errors.append("Add a salesperson to the list above before submitting.")
         if payment_method == "Ok to Invoice" and (amount is None or amount <= 0):
             errors.append("Amount is required and must be greater than 0 when 'Ok to Invoice' is selected.")
 
