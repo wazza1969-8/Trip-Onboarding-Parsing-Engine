@@ -66,33 +66,40 @@ st.title("Trip Support Intake")
 tab_new, tab_requests = st.tabs(["Submit New Request", "My Requests"])
 
 with tab_new:
-    with st.form("intake_form", clear_on_submit=True):
-        salesperson = st.selectbox("Salesperson", SALESPEOPLE)
+    # Plain widgets (not st.form) on purpose: inside a form, Streamlit
+    # batches every input and only reruns the script on submit, so the
+    # Amount/Notes fields wouldn't appear until after clicking Submit.
+    # Outside a form, selecting "Ok to Invoice" triggers an immediate
+    # rerun, and these fields open up right away as required.
+    salesperson = st.selectbox("Salesperson", SALESPEOPLE, key="salesperson")
 
-        acct_nbr = st.text_input(
-            "Jeppesen Acct Nbr:",
-            max_chars=MAX_ACCT_NBR_LEN,
-            help=f"Max {MAX_ACCT_NBR_LEN} characters.",
+    acct_nbr = st.text_input(
+        "Jeppesen Acct Nbr:",
+        max_chars=MAX_ACCT_NBR_LEN,
+        help=f"Max {MAX_ACCT_NBR_LEN} characters.",
+        key="acct_nbr",
+    )
+
+    payment_method = st.radio("Payment Method", PAYMENT_METHODS, horizontal=True, key="payment_method")
+
+    amount = None
+    notes = ""
+    if payment_method == "Ok to Invoice":
+        amount = st.number_input(
+            "Amount (required)", min_value=0.0, step=0.01, format="%.2f",
+            help="Required when 'Ok to Invoice' is selected.",
+            key="amount",
         )
+        notes = st.text_area("Notes (optional)", key="notes")
 
-        payment_method = st.radio("Payment Method", PAYMENT_METHODS, horizontal=True)
+    uploaded_file = st.file_uploader(
+        "Onboarding Form Upload (optional)",
+        type=ALLOWED_UPLOAD_TYPES,
+        help="PDF, Word, or image of the completed onboarding form.",
+        key="uploaded_file",
+    )
 
-        amount = None
-        notes = ""
-        if payment_method == "Ok to Invoice":
-            amount = st.number_input(
-                "Amount (required)", min_value=0.0, step=0.01, format="%.2f",
-                help="Required when 'Ok to Invoice' is selected.",
-            )
-            notes = st.text_area("Notes (optional)")
-
-        uploaded_file = st.file_uploader(
-            "Onboarding Form Upload (optional)",
-            type=ALLOWED_UPLOAD_TYPES,
-            help="PDF, Word, or image of the completed onboarding form.",
-        )
-
-        submitted = st.form_submit_button("Submit")
+    submitted = st.button("Submit")
 
     if submitted:
         errors = []
