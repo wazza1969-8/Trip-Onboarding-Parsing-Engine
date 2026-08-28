@@ -129,6 +129,7 @@ with tab_new:
                     request_id, onboarding_bytes,
                     progress_callback=_on_progress,
                     secrets_getter=lambda: st.secrets,
+                    salesperson=salesperson,
                 )
                 progress.empty()
                 refreshed = backend.fetch_request(request_id)
@@ -184,6 +185,7 @@ with tab_requests:
                         row["id"], row["onboarding_bytes"],
                         progress_callback=_on_retry_progress,
                         secrets_getter=lambda: st.secrets,
+                        salesperson=row["salesperson"],
                     )
                     progress.empty()
                     st.rerun()

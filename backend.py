@@ -183,11 +183,13 @@ def get_anthropic_client(secrets_getter=None):
     )
 
 
-def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secrets_getter=None, db_path: Path = DB_PATH) -> None:
+def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secrets_getter=None, db_path: Path = DB_PATH, salesperson: str | None = None) -> None:
     """Runs the onboarding PDF through parsing_engine.py's pipeline and
     stores the resulting .xlsx (or the error) back on the request row.
     progress_callback(fraction: float, text: str), if given, is called
-    after each page is read."""
+    after each page is read. `salesperson` is the name selected in the
+    intake form's Salesperson dropdown -- passed through to General
+    Info's "Jeppesen FF Account Exec" line instead of a placeholder."""
     try:
         client, model = get_anthropic_client(secrets_getter)
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,7 +207,7 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
                     section["page"] = i
                     sections.append(section)
 
-            by_subject = pe.map_to_subjects(sections)
+            by_subject = pe.map_to_subjects(sections, salesperson=salesperson)
             pe.write_workbook(by_subject, out_path)
             result_bytes = out_path.read_bytes()
 

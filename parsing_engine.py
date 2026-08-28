@@ -249,11 +249,17 @@ Credit Card Customer - Advance deposit required.
 
 FFD acct under 'XXXXX' (linked)"""
 
-# Always appended to "General Info", verbatim, on every run -- a manual
-# fill-in placeholder line.
-GENERAL_INFO_STATIC_LINES = [
-    "Jeppesen FF Account Exec: >> Add Name <<",
-]
+# Always appended to "General Info" on every run. The Account Exec name
+# comes from the Salesperson selected in the intake UI (passed through
+# map_to_subjects()/add_static_content() as `salesperson`); if none is
+# given -- e.g. running this script standalone from the CLI -- it falls
+# back to a manual fill-in placeholder.
+GENERAL_INFO_ACCOUNT_EXEC_PLACEHOLDER = ">> Add Name <<"
+
+
+def _general_info_static_lines(salesperson: str | None = None) -> list[str]:
+    name = (salesperson or "").strip() or GENERAL_INFO_ACCOUNT_EXEC_PLACEHOLDER
+    return [f"Jeppesen FF Account Exec: {name}"]
 
 # The fixed option set for Aircraft Details Q2 ("What types of flight do
 # you operate?"). Always rendered in full with the customer's selection(s)
@@ -878,9 +884,11 @@ ACTIVE_CONTENT_SUBJECTS = {
 }
 
 
-def map_to_subjects(sections: list[dict]) -> dict[str, list[str]]:
+def map_to_subjects(sections: list[dict], salesperson: str | None = None) -> dict[str, list[str]]:
     """{subject: [formatted comment lines]}, grouped and labeled by
-    source heading so provenance stays traceable."""
+    source heading so provenance stays traceable. `salesperson` is the
+    name selected in the intake UI, threaded through to General Info's
+    "Jeppesen FF Account Exec" line -- see add_static_content()."""
     by_subject: dict[str, list[str]] = {s: [] for s in SUBJECTS}
     unmapped_headings = set()
     dropped_fields = []
@@ -970,15 +978,17 @@ def map_to_subjects(sections: list[dict]) -> dict[str, list[str]]:
             file=sys.stderr,
         )
 
-    add_static_content(by_subject)
+    add_static_content(by_subject, salesperson=salesperson)
     return by_subject
 
 
-def add_static_content(by_subject: dict[str, list[str]]) -> None:
+def add_static_content(by_subject: dict[str, list[str]], salesperson: str | None = None) -> None:
     """Inject fixed boilerplate that is not derived from the source PDF.
     Runs on every document, appended after any extracted content."""
     by_subject.setdefault("High Profile Notes", []).insert(0, HIGH_PROFILE_NOTES_TEMPLATE)
-    by_subject.setdefault("General Info", []).append("\n".join(GENERAL_INFO_STATIC_LINES))
+    by_subject.setdefault("General Info", []).append(
+        "\n".join(_general_info_static_lines(salesperson))
+    )
 
     # Fuel's only defined field (Preferred Fuel Provider) always renders
     # with an N/A fallback -- but if it was never answered anywhere in
