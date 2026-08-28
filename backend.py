@@ -172,7 +172,7 @@ def get_anthropic_client(secrets_getter=None):
     bedrock_token = _get_secret(secrets_getter, "AWS_BEARER_TOKEN_BEDROCK")
     if bedrock_token:
         region = _get_secret(secrets_getter, "AWS_REGION") or "us-east-1"
-        model = _get_secret(secrets_getter, "BEDROCK_MODEL_ID") or f"us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        model = _get_secret(secrets_getter, "BEDROCK_MODEL_ID") or "us.anthropic.claude-sonnet-5"
         client = anthropic.AnthropicBedrock(aws_region=region, api_key=bedrock_token)
         return client, model
 
