@@ -83,7 +83,7 @@ TASK_DESCRIPTIONS = {
 DISABLED_TASKS = {"Weekly Report"}
 DISABLED_BANNER_TEXT = "Getting It Done"
 
-st.set_page_config(page_title="ITP Sales Hub", page_icon="\U0001F4CB", layout="centered")
+st.set_page_config(page_title="ITP Sales Hub", page_icon="\U0001F4CB", layout="wide")
 
 # Jeppesen ForeFlight brand: dark teal-to-navy gradient + logo, matching
 # the splash-screen colors provided. Base64-embedded so no separate
@@ -96,6 +96,16 @@ st.markdown(
     .stApp {{
         background: radial-gradient(circle at 12% 8%, #3a7686 0%, #234b5c 28%, #16303f 55%, #051628 100%);
         background-attachment: fixed;
+    }}
+    /* "wide" removes Streamlit's narrow ~730px centered column; this
+    caps it at a still-generous width instead of stretching content
+    edge-to-edge on large monitors. */
+    [data-testid="stAppViewContainer"] .block-container {{
+        max-width: 1200px;
+        padding-top: 2.5rem;
+        padding-left: 3rem;
+        padding-right: 3rem;
+        margin: 0 auto;
     }}
     h1, h2, h3, h4, h5, h6, p, label, span, div {{
         color: #eaf3f6;
