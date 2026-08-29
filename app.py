@@ -18,8 +18,9 @@ request ID and a status that moves through:
     Submitted -> Processing -> Complete
                              -> Failed  (with an error message + Retry)
 
-If no onboarding form is attached, the request is stored as Submitted
-with nothing to parse -- there's no PDF to run through the engine.
+The onboarding form upload is required -- Submit is blocked until a
+file is attached, since there's nothing for the parser to run against
+otherwise.
 
 Requirements
 ------------
@@ -270,61 +271,76 @@ if task == "Trip Preference Parsing":
         else:
             salesperson = st.selectbox("Salesperson", salespeople, key="salesperson")
 
-        with st.expander("Manage salesperson list"):
-            st.caption("Changes apply immediately for everyone using this app.")
+        # Compact toggle button (sized to its label, not the full row) so
+        # this passive, occasionally-used feature stays out of the way
+        # until someone actually clicks it -- only then does it expand
+        # into a full-width panel with room for all the controls.
+        if "show_salesperson_manager" not in st.session_state:
+            st.session_state["show_salesperson_manager"] = False
 
-            st.markdown("**Add**")
-            new_name = st.text_input("New salesperson name", key="new_salesperson_name")
-            if st.button("Add", key="add_salesperson_btn"):
-                try:
-                    backend.add_salesperson(new_name)
-                    st.toast(f"Added '{new_name.strip()}'.")
-                    st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
+        toggle_label = (
+            "▾ Manage salesperson list" if st.session_state["show_salesperson_manager"]
+            else "⚙️ Manage salesperson list"
+        )
+        if st.button(toggle_label, key="toggle_salesperson_manager"):
+            st.session_state["show_salesperson_manager"] = not st.session_state["show_salesperson_manager"]
 
-            if salespeople:
-                st.markdown("**Rename**")
-                rename_target = st.selectbox("Salesperson", salespeople, key="rename_salesperson_select")
-                rename_new_name = st.text_input("New name", key="rename_salesperson_new_name")
-                if st.button("Save rename", key="save_rename_btn"):
+        if st.session_state["show_salesperson_manager"]:
+            with st.container(border=True):
+                st.caption("Changes apply immediately for everyone using this app.")
+
+                st.markdown("**Add**")
+                new_name = st.text_input("New salesperson name", key="new_salesperson_name")
+                if st.button("Add", key="add_salesperson_btn"):
                     try:
-                        backend.update_salesperson(rename_target, rename_new_name)
-                        st.toast(f"Renamed '{rename_target}' to '{rename_new_name.strip()}'.")
+                        backend.add_salesperson(new_name)
+                        st.toast(f"Added '{new_name.strip()}'.")
                         st.rerun()
                     except ValueError as e:
                         st.error(str(e))
 
-                st.markdown("**Delete**")
-                delete_target = st.selectbox("Salesperson", salespeople, key="delete_salesperson_select")
-                if st.button("Delete", key="delete_salesperson_btn"):
-                    backend.delete_salesperson(delete_target)
-                    st.toast(f"Deleted '{delete_target}'.")
-                    st.rerun()
+                if salespeople:
+                    st.markdown("**Rename**")
+                    rename_target = st.selectbox("Salesperson", salespeople, key="rename_salesperson_select")
+                    rename_new_name = st.text_input("New name", key="rename_salesperson_new_name")
+                    if st.button("Save rename", key="save_rename_btn"):
+                        try:
+                            backend.update_salesperson(rename_target, rename_new_name)
+                            st.toast(f"Renamed '{rename_target}' to '{rename_new_name.strip()}'.")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
 
-            st.markdown("**Backup / restore**")
-            st.caption(
-                "This app's storage isn't guaranteed to survive every redeploy. "
-                "Download a backup now and then, and restore it here if the "
-                "list ever comes back empty unexpectedly."
-            )
-            st.download_button(
-                "Download backup (.json)",
-                data=backend.export_salespeople_json(),
-                file_name="salespeople_backup.json",
-                mime="application/json",
-                key="download_salespeople_backup",
-            )
-            restore_file = st.file_uploader(
-                "Restore from a backup file", type=["json"], key="restore_salespeople_file"
-            )
-            if restore_file is not None and st.button("Restore", key="restore_salespeople_btn"):
-                try:
-                    added, skipped = backend.import_salespeople_json(restore_file.read().decode("utf-8"))
-                    st.toast(f"Restored: added {added}, already present {skipped}.")
-                    st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
+                    st.markdown("**Delete**")
+                    delete_target = st.selectbox("Salesperson", salespeople, key="delete_salesperson_select")
+                    if st.button("Delete", key="delete_salesperson_btn"):
+                        backend.delete_salesperson(delete_target)
+                        st.toast(f"Deleted '{delete_target}'.")
+                        st.rerun()
+
+                st.markdown("**Backup / restore**")
+                st.caption(
+                    "This app's storage isn't guaranteed to survive every redeploy. "
+                    "Download a backup now and then, and restore it here if the "
+                    "list ever comes back empty unexpectedly."
+                )
+                st.download_button(
+                    "Download backup (.json)",
+                    data=backend.export_salespeople_json(),
+                    file_name="salespeople_backup.json",
+                    mime="application/json",
+                    key="download_salespeople_backup",
+                )
+                restore_file = st.file_uploader(
+                    "Restore from a backup file", type=["json"], key="restore_salespeople_file"
+                )
+                if restore_file is not None and st.button("Restore", key="restore_salespeople_btn"):
+                    try:
+                        added, skipped = backend.import_salespeople_json(restore_file.read().decode("utf-8"))
+                        st.toast(f"Restored: added {added}, already present {skipped}.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
 
         acct_nbr = st.text_input(
             "Jeppesen Acct Nbr:",
@@ -347,10 +363,14 @@ if task == "Trip Preference Parsing":
 
         # st.file_uploader always renders as a drag-and-drop dropzone
         # (plus a Browse button) -- no extra work needed for that.
+        # Required -- the parser has nothing to run against without it, so
+        # both the label and a caption call that out clearly, and the
+        # Submit validation below blocks the request until a file is here.
+        st.markdown("##### Onboarding Form Upload &nbsp; :red[**\\* Required**]")
+        st.caption("The parser can't run without this file -- upload the completed onboarding form to continue.")
         uploaded_file = st.file_uploader(
-            "Onboarding Form Upload (optional)",
+            "Drag and drop, or browse for, a PDF/Word/image of the completed onboarding form",
             type=ALLOWED_UPLOAD_TYPES,
-            help="Drag and drop, or browse for, a PDF/Word/image of the completed onboarding form.",
             key="uploaded_file",
         )
 
@@ -362,6 +382,8 @@ if task == "Trip Preference Parsing":
                 errors.append("Add a salesperson to the list above before submitting.")
             if payment_method == "Ok to Invoice" and (amount is None or amount <= 0):
                 errors.append("Amount is required and must be greater than 0 when 'Ok to Invoice' is selected.")
+            if uploaded_file is None:
+                errors.append("Upload the onboarding form before submitting -- it's required to run the parser.")
 
             if errors:
                 for e in errors:
