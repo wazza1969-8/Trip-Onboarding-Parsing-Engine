@@ -12,7 +12,7 @@ import os
 import sqlite3
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import parsing_engine as pe
@@ -28,6 +28,22 @@ STATUS_FAILED = "Failed"
 # and is built entirely from what's added via the UI's "Manage
 # salesperson list" controls.
 DEFAULT_SALESPEOPLE: list[str] = []
+
+# Weekly Report has its own roster, separate from the salespeople list --
+# the people submitting weekly reports aren't the same group as the
+# Trip Preference Parsing salespeople. No placeholder names are seeded,
+# same as salespeople.
+DEFAULT_REPORT_TEAM_MEMBERS: list[str] = []
+
+# Weekly Report categories -- (db column name, label shown on the form
+# and in the compiled report).
+WEEKLY_REPORT_CATEGORIES = [
+    ("highlights", "Highlights / Major Accomplishments / Wins"),
+    ("opportunities", "Opportunities / Sales Engagements"),
+    ("watch_items", "Watch Items / Help Needed"),
+    ("upcoming_events", "Upcoming Events"),
+    ("other", "Other"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +71,33 @@ def get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
     )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS salespeople (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL COLLATE NOCASE
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS weekly_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submitter TEXT NOT NULL,
+            period TEXT NOT NULL,
+            highlights TEXT,
+            opportunities TEXT,
+            watch_items TEXT,
+            upcoming_events TEXT,
+            other TEXT,
+            submitted_at TEXT,
+            updated_at TEXT,
+            UNIQUE(submitter, period)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS report_recipients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL COLLATE NOCASE
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS report_team_members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL COLLATE NOCASE
         )"""
@@ -163,6 +206,293 @@ def import_salespeople_json(json_text: str, db_path: Path = DB_PATH) -> tuple[in
         add_salesperson(name, db_path)
         existing.add(name.lower())
         added += 1
+    return added, skipped
+
+
+# ---------------------------------------------------------------------------
+# Weekly Report team roster -- editable from the UI (Add/Rename/Delete),
+# same pattern as the salesperson list, but a separate table: the people
+# submitting weekly reports are a different group than the Trip
+# Preference Parsing salespeople.
+# ---------------------------------------------------------------------------
+def list_report_team_members(db_path: Path = DB_PATH) -> list[str]:
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute("SELECT name FROM report_team_members ORDER BY name COLLATE NOCASE").fetchall()
+        if not rows:
+            for name in DEFAULT_REPORT_TEAM_MEMBERS:
+                conn.execute("INSERT OR IGNORE INTO report_team_members (name) VALUES (?)", (name,))
+            conn.commit()
+            rows = conn.execute("SELECT name FROM report_team_members ORDER BY name COLLATE NOCASE").fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def add_report_team_member(name: str, db_path: Path = DB_PATH) -> None:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Name can't be blank.")
+    conn = get_conn(db_path)
+    try:
+        try:
+            conn.execute("INSERT INTO report_team_members (name) VALUES (?)", (name,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"'{name}' is already in the list.")
+    finally:
+        conn.close()
+
+
+def update_report_team_member(old_name: str, new_name: str, db_path: Path = DB_PATH) -> None:
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("Name can't be blank.")
+    conn = get_conn(db_path)
+    try:
+        try:
+            cur = conn.execute("UPDATE report_team_members SET name = ? WHERE name = ?", (new_name, old_name))
+            if cur.rowcount == 0:
+                raise ValueError(f"'{old_name}' was not found (it may have just been changed elsewhere).")
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"'{new_name}' is already in the list.")
+    finally:
+        conn.close()
+
+
+def delete_report_team_member(name: str, db_path: Path = DB_PATH) -> None:
+    conn = get_conn(db_path)
+    try:
+        conn.execute("DELETE FROM report_team_members WHERE name = ?", (name,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def export_report_team_members_json(db_path: Path = DB_PATH) -> str:
+    return json.dumps({"team_members": list_report_team_members(db_path)}, indent=2)
+
+
+def import_report_team_members_json(json_text: str, db_path: Path = DB_PATH) -> tuple[int, int]:
+    try:
+        data = json.loads(json_text)
+        names = data["team_members"]
+        if not isinstance(names, list):
+            raise TypeError
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise ValueError("That doesn't look like a team-member backup file.") from e
+
+    existing = {n.lower() for n in list_report_team_members(db_path)}
+    added = 0
+    skipped = 0
+    for name in names:
+        name = (name or "").strip()
+        if not name:
+            continue
+        if name.lower() in existing:
+            skipped += 1
+            continue
+        add_report_team_member(name, db_path)
+        existing.add(name.lower())
+        added += 1
+    return added, skipped
+
+
+# ---------------------------------------------------------------------------
+# Weekly Report -- team members submit their update for the current
+# period (an ISO week, e.g. "2026-W35") under a fixed set of categories
+# (WEEKLY_REPORT_CATEGORIES above); a manager then compiles everyone's
+# submissions for a period into one report, ready to copy into an email
+# or download. Sending isn't wired up yet -- see compile_weekly_report_text().
+# ---------------------------------------------------------------------------
+def current_period(on_date: date | None = None) -> str:
+    d = on_date or datetime.now(timezone.utc).date()
+    iso_year, iso_week, _ = d.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def period_label(period: str) -> str:
+    """Turns 'YYYY-Www' into a human-readable date range, e.g.
+    'Week of Aug 24 - Aug 30, 2026'. Falls back to the raw string if it
+    doesn't parse."""
+    try:
+        year_str, week_str = period.split("-W")
+        monday = date.fromisocalendar(int(year_str), int(week_str), 1)
+        sunday = date.fromisocalendar(int(year_str), int(week_str), 7)
+        if monday.month == sunday.month:
+            return f"Week of {monday.strftime('%b %d')}-{sunday.strftime('%d, %Y')}"
+        return f"Week of {monday.strftime('%b %d')} - {sunday.strftime('%b %d, %Y')}"
+    except (ValueError, IndexError):
+        return period
+
+
+def upsert_weekly_report(submitter: str, period: str, values: dict, db_path: Path = DB_PATH) -> None:
+    """Saves (or overwrites) one submitter's report for one period. Safe
+    to call again for the same submitter/period -- e.g. if they come
+    back to edit before the report gets compiled."""
+    submitter = (submitter or "").strip()
+    if not submitter:
+        raise ValueError("Select your name before submitting.")
+    cols = [key for key, _ in WEEKLY_REPORT_CATEGORIES]
+    now = _now()
+    conn = get_conn(db_path)
+    try:
+        existing = conn.execute(
+            "SELECT id FROM weekly_reports WHERE submitter = ? AND period = ?", (submitter, period)
+        ).fetchone()
+        col_values = [values.get(c, "") for c in cols]
+        if existing:
+            set_clause = ", ".join(f"{c} = ?" for c in cols)
+            conn.execute(
+                f"UPDATE weekly_reports SET {set_clause}, updated_at = ? WHERE submitter = ? AND period = ?",
+                (*col_values, now, submitter, period),
+            )
+        else:
+            col_list = ", ".join(cols)
+            placeholders = ", ".join("?" for _ in cols)
+            conn.execute(
+                f"""INSERT INTO weekly_reports (submitter, period, {col_list}, submitted_at, updated_at)
+                    VALUES (?, ?, {placeholders}, ?, ?)""",
+                (submitter, period, *col_values, now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_weekly_report(submitter: str, period: str, db_path: Path = DB_PATH):
+    conn = get_conn(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT * FROM weekly_reports WHERE submitter = ? AND period = ?", (submitter, period)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def list_weekly_reports_for_period(period: str, db_path: Path = DB_PATH) -> list[sqlite3.Row]:
+    conn = get_conn(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT * FROM weekly_reports WHERE period = ? ORDER BY submitter COLLATE NOCASE", (period,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def list_weekly_report_periods(db_path: Path = DB_PATH) -> list[str]:
+    """Every period that has at least one submission, most recent first."""
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute("SELECT DISTINCT period FROM weekly_reports ORDER BY period DESC").fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def compile_weekly_report_text(period: str, db_path: Path = DB_PATH, expected_submitters: list[str] | None = None) -> str:
+    """Groups every submission for a period by category into one
+    plain-text report, formatted to be readable pasted directly into an
+    email body."""
+    rows = list_weekly_reports_for_period(period, db_path)
+    lines = [f"WEEKLY TEAM REPORT -- {period_label(period)}", ""]
+
+    if not rows:
+        lines.append("No reports have been submitted for this period yet.")
+    else:
+        for key, label in WEEKLY_REPORT_CATEGORIES:
+            entries = [(r["submitter"], (r[key] or "").strip()) for r in rows]
+            entries = [(name, text) for name, text in entries if text]
+            lines.append(label.upper())
+            if entries:
+                for name, text in entries:
+                    lines.append(f"  - {name}: {text}")
+            else:
+                lines.append("  (nothing reported)")
+            lines.append("")
+
+        submitted = sorted({r["submitter"] for r in rows})
+        lines.append(f"Submitted by: {', '.join(submitted)}")
+
+    if expected_submitters:
+        missing = sorted(set(expected_submitters) - {r["submitter"] for r in rows})
+        if missing:
+            lines.append(f"Not yet submitted: {', '.join(missing)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Weekly Report recipients -- editable from the UI, same Add/Delete +
+# backup pattern as the salesperson list.
+# ---------------------------------------------------------------------------
+def list_recipients(db_path: Path = DB_PATH) -> list[str]:
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute("SELECT email FROM report_recipients ORDER BY email COLLATE NOCASE").fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def add_recipient(email: str, db_path: Path = DB_PATH) -> None:
+    email = (email or "").strip()
+    if not email:
+        raise ValueError("Email can't be blank.")
+    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+        raise ValueError(f"'{email}' doesn't look like a valid email address.")
+    conn = get_conn(db_path)
+    try:
+        try:
+            conn.execute("INSERT INTO report_recipients (email) VALUES (?)", (email,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"'{email}' is already in the list.")
+    finally:
+        conn.close()
+
+
+def delete_recipient(email: str, db_path: Path = DB_PATH) -> None:
+    conn = get_conn(db_path)
+    try:
+        conn.execute("DELETE FROM report_recipients WHERE email = ?", (email,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def export_recipients_json(db_path: Path = DB_PATH) -> str:
+    return json.dumps({"recipients": list_recipients(db_path)}, indent=2)
+
+
+def import_recipients_json(json_text: str, db_path: Path = DB_PATH) -> tuple[int, int]:
+    try:
+        data = json.loads(json_text)
+        emails = data["recipients"]
+        if not isinstance(emails, list):
+            raise TypeError
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise ValueError("That doesn't look like a recipients backup file.") from e
+
+    existing = {e.lower() for e in list_recipients(db_path)}
+    added = 0
+    skipped = 0
+    for email in emails:
+        email = (email or "").strip()
+        if not email:
+            continue
+        if email.lower() in existing:
+            skipped += 1
+            continue
+        try:
+            add_recipient(email, db_path)
+            existing.add(email.lower())
+            added += 1
+        except ValueError:
+            skipped += 1
     return added, skipped
 
 

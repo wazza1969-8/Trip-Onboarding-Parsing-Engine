@@ -9,7 +9,12 @@ Landing screen lets the user pick which parsing task they want to run:
   - Flight Planning Parsing: parses a completed Flight Planning
     Preferences form into the Flight Plan Template. Not wired up yet --
     see the note in that section below.
-  - Weekly Report: not yet defined -- see the note in that section below.
+  - Weekly Report: team members submit their update for the current
+    week under a fixed set of categories; a manager compiles everyone's
+    submissions into one report, ready to copy into an email or
+    download. Actually sending email isn't wired up yet -- pick an
+    email method (Gmail app password, company SMTP, or a transactional
+    API like SendGrid) and that's a small follow-on to add.
 
 Every Trip Preference Parsing submission becomes a row in a local
 SQLite database (requests.db, created next to backend.py) with a short
@@ -74,13 +79,14 @@ TASK_DESCRIPTIONS = {
                                 "onboarding form into the Operational Information spreadsheet.",
     "Flight Planning Parsing": "Parse a completed Flight Planning Preferences form "
                                 "into the Flight Plan Template.",
-    "Weekly Report": "Generate a weekly report.",
+    "Weekly Report": "Submit your weekly update, or compile everyone's "
+                     "submissions into one team report.",
 }
 
 # Tasks that are visible on the landing screen but not selectable yet --
 # rendered grayed-out with a diagonal "on hold" banner instead of a
 # working card. Remove a task from this set once it's ready to build.
-DISABLED_TASKS = {"Weekly Report"}
+DISABLED_TASKS = set()
 DISABLED_BANNER_TEXT = "Getting It Done"
 
 st.set_page_config(page_title="ITP Sales Hub", page_icon="\U0001F4CB", layout="wide")
@@ -523,13 +529,217 @@ elif task == "Flight Planning Parsing":
     )
 
 # ---------------------------------------------------------------------------
-# Weekly Report -- not yet defined. Placeholder pending scope: does this
-# summarize requests already processed through this app, or parse an
-# uploaded weekly document?
+# Weekly Report -- team members submit their update for the current
+# period under WEEKLY_REPORT_CATEGORIES (backend.py); "Compile Weekly
+# Report" groups every submission for a chosen period into one report.
+# Actually emailing it out isn't wired up yet -- the compiled report is
+# a copy/download only, ready to paste into an email once a sending
+# method (Gmail app password / company SMTP / SendGrid etc.) is picked.
 # ---------------------------------------------------------------------------
 elif task == "Weekly Report":
-    st.info(
-        "Weekly Report isn't defined yet -- let me know what it should cover "
-        "(e.g. a summary of requests processed through this app, or parsing an "
-        "uploaded weekly document) and this gets built out."
-    )
+    tab_submit, tab_compile = st.tabs(["Submit My Report", "Compile Weekly Report"])
+
+    with tab_submit:
+        team = backend.list_report_team_members()
+
+        # Same compact toggle pattern as "Manage salesperson list" -- kept
+        # out of the way until someone actually needs to edit the roster.
+        if "show_team_manager" not in st.session_state:
+            st.session_state["show_team_manager"] = False
+
+        toggle_team_label = (
+            "▾ Manage team members" if st.session_state["show_team_manager"]
+            else "⚙️ Manage team members"
+        )
+        if st.button(toggle_team_label, key="toggle_team_manager"):
+            st.session_state["show_team_manager"] = not st.session_state["show_team_manager"]
+
+        if st.session_state["show_team_manager"]:
+            with st.container(border=True):
+                st.caption("Changes apply immediately for everyone using this app.")
+
+                st.markdown("**Add**")
+                new_team_name = st.text_input("New team member name", key="new_team_member_name")
+                if st.button("Add", key="add_team_member_btn"):
+                    try:
+                        backend.add_report_team_member(new_team_name)
+                        st.toast(f"Added '{new_team_name.strip()}'.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+                if team:
+                    st.markdown("**Rename**")
+                    rename_team_target = st.selectbox("Team member", team, key="rename_team_member_select")
+                    rename_team_new_name = st.text_input("New name", key="rename_team_member_new_name")
+                    if st.button("Save rename", key="save_team_rename_btn"):
+                        try:
+                            backend.update_report_team_member(rename_team_target, rename_team_new_name)
+                            st.toast(f"Renamed '{rename_team_target}' to '{rename_team_new_name.strip()}'.")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+
+                    st.markdown("**Delete**")
+                    delete_team_target = st.selectbox("Team member", team, key="delete_team_member_select")
+                    if st.button("Delete", key="delete_team_member_btn"):
+                        backend.delete_report_team_member(delete_team_target)
+                        st.toast(f"Deleted '{delete_team_target}'.")
+                        st.rerun()
+
+                st.markdown("**Backup / restore**")
+                st.caption(
+                    "This app's storage isn't guaranteed to survive every redeploy. "
+                    "Download a backup now and then, and restore it here if the "
+                    "list ever comes back empty unexpectedly."
+                )
+                st.download_button(
+                    "Download backup (.json)",
+                    data=backend.export_report_team_members_json(),
+                    file_name="report_team_members_backup.json",
+                    mime="application/json",
+                    key="download_team_members_backup",
+                )
+                restore_team_file = st.file_uploader(
+                    "Restore from a backup file", type=["json"], key="restore_team_members_file"
+                )
+                if restore_team_file is not None and st.button("Restore", key="restore_team_members_btn"):
+                    try:
+                        added, skipped = backend.import_report_team_members_json(restore_team_file.read().decode("utf-8"))
+                        st.toast(f"Restored: added {added}, already present {skipped}.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+        if not team:
+            st.warning("No team members configured yet. Add names above before submitting a report.")
+        else:
+            submitter = st.selectbox("Your name", team, key="wr_submitter")
+            period = backend.current_period()
+            st.caption(f"Reporting period: {backend.period_label(period)}")
+
+            existing = backend.get_weekly_report(submitter, period)
+            if existing:
+                st.caption("You've already submitted for this period -- editing and submitting again will update it.")
+
+            values = {}
+            for key, label in backend.WEEKLY_REPORT_CATEGORIES:
+                values[key] = st.text_area(
+                    label,
+                    value=(existing[key] if existing and existing[key] else ""),
+                    key=f"wr_{key}",
+                )
+
+            if st.button("Submit report", key="wr_submit_btn"):
+                backend.upsert_weekly_report(submitter, period, values)
+                st.toast(f"Saved your report for {submitter}.")
+                st.rerun()
+
+    with tab_compile:
+        periods = backend.list_weekly_report_periods()
+        current = backend.current_period()
+        if current not in periods:
+            periods = [current] + periods
+
+        period_to_compile = st.selectbox(
+            "Period", periods, index=0, key="wr_compile_period", format_func=backend.period_label,
+        )
+
+        team = backend.list_report_team_members()
+        rows = backend.list_weekly_reports_for_period(period_to_compile)
+        submitted_names = {r["submitter"] for r in rows}
+        missing = [n for n in team if n not in submitted_names]
+
+        if team:
+            st.caption(f"{len(rows)} of {len(team)} team members submitted for this period.")
+        else:
+            st.caption(f"{len(rows)} submission(s) for this period.")
+        if missing:
+            st.warning("Not yet submitted: " + ", ".join(missing))
+
+        # Same compact toggle pattern as "Manage salesperson list" -- kept
+        # out of the way until someone actually needs to edit recipients.
+        if "show_recipient_manager" not in st.session_state:
+            st.session_state["show_recipient_manager"] = False
+
+        recipients = backend.list_recipients()
+
+        toggle_label = (
+            "▾ Manage recipients" if st.session_state["show_recipient_manager"]
+            else "⚙️ Manage recipients"
+        )
+        if st.button(toggle_label, key="toggle_recipient_manager"):
+            st.session_state["show_recipient_manager"] = not st.session_state["show_recipient_manager"]
+
+        if st.session_state["show_recipient_manager"]:
+            with st.container(border=True):
+                st.caption("Changes apply immediately for everyone using this app.")
+
+                st.markdown("**Add**")
+                new_email = st.text_input("Email address", key="new_recipient_email")
+                if st.button("Add", key="add_recipient_btn"):
+                    try:
+                        backend.add_recipient(new_email)
+                        st.toast(f"Added '{new_email.strip()}'.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+                if recipients:
+                    st.markdown("**Delete**")
+                    delete_target = st.selectbox("Recipient", recipients, key="delete_recipient_select")
+                    if st.button("Delete", key="delete_recipient_btn"):
+                        backend.delete_recipient(delete_target)
+                        st.toast(f"Deleted '{delete_target}'.")
+                        st.rerun()
+
+                st.markdown("**Backup / restore**")
+                st.caption(
+                    "This app's storage isn't guaranteed to survive every redeploy. "
+                    "Download a backup now and then, and restore it here if the "
+                    "list ever comes back empty unexpectedly."
+                )
+                st.download_button(
+                    "Download backup (.json)",
+                    data=backend.export_recipients_json(),
+                    file_name="report_recipients_backup.json",
+                    mime="application/json",
+                    key="download_recipients_backup",
+                )
+                restore_file = st.file_uploader(
+                    "Restore from a backup file", type=["json"], key="restore_recipients_file"
+                )
+                if restore_file is not None and st.button("Restore", key="restore_recipients_btn"):
+                    try:
+                        added, skipped = backend.import_recipients_json(restore_file.read().decode("utf-8"))
+                        st.toast(f"Restored: added {added}, already present {skipped}.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+        st.markdown("**Recipients**")
+        if recipients:
+            st.code("; ".join(recipients), language=None)
+        else:
+            st.info("No recipients added yet -- add some above before sending this out.")
+
+        report_text = backend.compile_weekly_report_text(period_to_compile, expected_submitters=team or None)
+
+        st.markdown("**Compiled report**")
+        st.caption("Click the copy icon in the corner to copy this into an email, or download it below.")
+        st.code(report_text, language=None)
+
+        st.download_button(
+            "Download report (.txt)",
+            data=report_text,
+            file_name=f"weekly_report_{period_to_compile}.txt",
+            mime="text/plain",
+            key="wr_download_btn",
+        )
+
+        st.info(
+            "Sending isn't automated yet -- copy the report above into an email to "
+            "the recipients listed, or let me know which email method you want to "
+            "use (Gmail app password, company SMTP, or a service like SendGrid) "
+            "and this can send automatically with one click."
+        )
