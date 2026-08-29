@@ -7,6 +7,7 @@ be exercised directly in a plain Python process/tests, without needing
 a live Streamlit runtime context.
 """
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -125,6 +126,44 @@ def delete_salesperson(name: str, db_path: Path = DB_PATH) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def export_salespeople_json(db_path: Path = DB_PATH) -> str:
+    """Serializes the current salesperson list to a JSON string, for the
+    UI's "Download backup" button. Streamlit Community Cloud's local
+    filesystem isn't guaranteed to survive a redeploy, so this file is
+    the safety net: download it every so often, and restore it below if
+    the list ever comes back empty unexpectedly."""
+    return json.dumps({"salespeople": list_salespeople(db_path)}, indent=2)
+
+
+def import_salespeople_json(json_text: str, db_path: Path = DB_PATH) -> tuple[int, int]:
+    """Restores salespeople from a previously downloaded backup. Adds any
+    name not already present; silently skips ones that already exist
+    (case-insensitive) so restoring is safe to run more than once.
+    Returns (added_count, skipped_count)."""
+    try:
+        data = json.loads(json_text)
+        names = data["salespeople"]
+        if not isinstance(names, list):
+            raise TypeError
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise ValueError("That doesn't look like a salesperson backup file.") from e
+
+    existing = {n.lower() for n in list_salespeople(db_path)}
+    added = 0
+    skipped = 0
+    for name in names:
+        name = (name or "").strip()
+        if not name:
+            continue
+        if name.lower() in existing:
+            skipped += 1
+            continue
+        add_salesperson(name, db_path)
+        existing.add(name.lower())
+        added += 1
+    return added, skipped
 
 
 def insert_request(fields: dict, db_path: Path = DB_PATH) -> str:

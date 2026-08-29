@@ -302,6 +302,30 @@ if task == "Trip Preference Parsing":
                     st.toast(f"Deleted '{delete_target}'.")
                     st.rerun()
 
+            st.markdown("**Backup / restore**")
+            st.caption(
+                "This app's storage isn't guaranteed to survive every redeploy. "
+                "Download a backup now and then, and restore it here if the "
+                "list ever comes back empty unexpectedly."
+            )
+            st.download_button(
+                "Download backup (.json)",
+                data=backend.export_salespeople_json(),
+                file_name="salespeople_backup.json",
+                mime="application/json",
+                key="download_salespeople_backup",
+            )
+            restore_file = st.file_uploader(
+                "Restore from a backup file", type=["json"], key="restore_salespeople_file"
+            )
+            if restore_file is not None and st.button("Restore", key="restore_salespeople_btn"):
+                try:
+                    added, skipped = backend.import_salespeople_json(restore_file.read().decode("utf-8"))
+                    st.toast(f"Restored: added {added}, already present {skipped}.")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
         acct_nbr = st.text_input(
             "Jeppesen Acct Nbr:",
             max_chars=MAX_ACCT_NBR_LEN,
