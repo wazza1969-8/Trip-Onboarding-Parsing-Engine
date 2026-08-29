@@ -409,7 +409,16 @@ def compile_weekly_report_text(period: str, db_path: Path = DB_PATH, expected_su
             lines.append(label.upper())
             if entries:
                 for name, text in entries:
-                    lines.append(f"  - {name}: {text}")
+                    # Each submission is stored as one bullet per line (from
+                    # the UI's "+ Add entry" boxes) -- render every bullet
+                    # as its own sub-line under that person's name.
+                    bullets = [b.strip() for b in text.split("\n") if b.strip()]
+                    if len(bullets) <= 1:
+                        lines.append(f"  - {name}: {bullets[0] if bullets else text}")
+                    else:
+                        lines.append(f"  - {name}:")
+                        for bullet in bullets:
+                            lines.append(f"      - {bullet}")
             else:
                 lines.append("  (nothing reported)")
             lines.append("")

@@ -54,9 +54,22 @@ Deploying for a few users
     to survive indefinitely.
 """
 
+import uuid
+
 import streamlit as st
 
 import backend
+
+# Icons shown next to each Weekly Report category -- purely cosmetic,
+# just for quick visual scanning; the underlying category keys/labels
+# still come from backend.WEEKLY_REPORT_CATEGORIES.
+WEEKLY_REPORT_CATEGORY_ICONS = {
+    "highlights": "\U0001F31F",       # star
+    "opportunities": "\U0001F91D",    # handshake
+    "watch_items": "⚠️",    # warning
+    "upcoming_events": "\U0001F4C5",  # calendar
+    "other": "\U0001F4DD",            # memo
+}
 
 # The salesperson list itself lives in the database (backend.py's
 # salespeople table) so it can be edited from the UI -- see the
@@ -622,13 +635,87 @@ elif task == "Weekly Report":
             if existing:
                 st.caption("You've already submitted for this period -- editing and submitting again will update it.")
 
+            # Each category starts with zero bullet-point boxes; "+ Add
+            # entry" appends one, the X removes one. Bullet widget state
+            # is only (re)loaded from the saved report when the selected
+            # submitter changes -- not on every rerun -- so add/remove
+            # clicks don't wipe unsaved edits.
+            load_marker_key = f"wr_loaded_for_{period}"
+            if st.session_state.get(load_marker_key) != submitter:
+                for key, _ in backend.WEEKLY_REPORT_CATEGORIES:
+                    saved_text = existing[key] if existing and existing[key] else ""
+                    saved_lines = [ln.strip() for ln in saved_text.split("\n") if ln.strip()]
+                    new_ids = []
+                    for line in saved_lines:
+                        item_id = uuid.uuid4().hex[:8]
+                        st.session_state[f"wr_{key}_{item_id}"] = line
+                        new_ids.append(item_id)
+                    st.session_state[f"wr_{key}_ids"] = new_ids
+                st.session_state[load_marker_key] = submitter
+
             values = {}
             for key, label in backend.WEEKLY_REPORT_CATEGORIES:
-                values[key] = st.text_area(
-                    label,
-                    value=(existing[key] if existing and existing[key] else ""),
-                    key=f"wr_{key}",
-                )
+                icon = WEEKLY_REPORT_CATEGORY_ICONS.get(key, "•")
+                ids_key = f"wr_{key}_ids"
+                if ids_key not in st.session_state:
+                    st.session_state[ids_key] = []
+                item_ids = st.session_state[ids_key]
+
+                with st.container(border=True):
+                    count = len(item_ids)
+                    st.markdown(
+                        f"##### {icon} {label} &nbsp; "
+                        f":gray[({count} {'entry' if count == 1 else 'entries'})]"
+                    )
+
+                    if not item_ids:
+                        st.caption("No entries yet -- click “+ Add entry” to add your first bullet point.")
+
+                    # Important: don't call st.rerun() from inside this loop.
+                    # Streamlit only keeps a widget's value if that widget
+                    # gets (re-)rendered during the run; rerun() aborts the
+                    # script immediately, so any row after the one clicked
+                    # would never render this pass and would lose its text.
+                    # So every row's widget always renders first, and the
+                    # delete is only actioned -- and rerun() only called --
+                    # once the whole loop has finished.
+                    pending_delete_id = None
+                    for item_id in list(item_ids):
+                        # Each row gets its own explicitly-keyed container so
+                        # Streamlit tracks its widgets by that key rather
+                        # than by position.
+                        with st.container(key=f"wr_{key}_row_{item_id}"):
+                            col_bullet, col_text, col_del = st.columns([0.05, 0.85, 0.10])
+                            with col_bullet:
+                                st.markdown(
+                                    "<div style='font-size:1.6rem; line-height:2.4rem; "
+                                    "color:#5fd0e8; text-align:center;'>&bull;</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            with col_text:
+                                st.text_input(
+                                    label,
+                                    label_visibility="collapsed",
+                                    key=f"wr_{key}_{item_id}",
+                                    placeholder=f"Add a {label.split(' / ')[0].lower()} entry...",
+                                )
+                            with col_del:
+                                if st.button("✕", key=f"wr_{key}_del_{item_id}", help="Remove this entry"):
+                                    pending_delete_id = item_id
+
+                    if pending_delete_id is not None:
+                        st.session_state[ids_key] = [i for i in st.session_state[ids_key] if i != pending_delete_id]
+                        st.session_state.pop(f"wr_{key}_{pending_delete_id}", None)
+                        st.rerun()
+
+                    if st.button("+ Add entry", key=f"wr_{key}_add_btn"):
+                        new_id = uuid.uuid4().hex[:8]
+                        st.session_state[ids_key] = st.session_state[ids_key] + [new_id]
+                        st.session_state[f"wr_{key}_{new_id}"] = ""
+                        st.rerun()
+
+                bullet_texts = [st.session_state.get(f"wr_{key}_{i}", "").strip() for i in st.session_state[ids_key]]
+                values[key] = "\n".join(t for t in bullet_texts if t)
 
             if st.button("Submit report", key="wr_submit_btn"):
                 backend.upsert_weekly_report(submitter, period, values)
