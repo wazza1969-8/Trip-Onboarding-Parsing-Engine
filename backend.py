@@ -23,10 +23,10 @@ STATUS_PROCESSING = "Processing"
 STATUS_COMPLETE = "Complete"
 STATUS_FAILED = "Failed"
 
-# Seeded into the salespeople table the first time it's empty -- after
-# that, the table (editable from the UI) is the source of truth, not
-# this list.
-DEFAULT_SALESPEOPLE = ["Jane Smith", "John Doe", "Alex Johnson", "Morgan Lee"]
+# No placeholder names are seeded -- the salesperson list starts empty
+# and is built entirely from what's added via the UI's "Manage
+# salesperson list" controls.
+DEFAULT_SALESPEOPLE: list[str] = []
 
 
 # ---------------------------------------------------------------------------

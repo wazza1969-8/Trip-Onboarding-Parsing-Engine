@@ -102,26 +102,35 @@ st.markdown(
     [data-testid="stCaptionContainer"] {{
         color: #a9c4cd !important;
     }}
-    .hero-logo {{
+    .hero-header {{
         display: flex;
-        justify-content: center;
-        margin: 0.6rem 0 0.6rem 0;
+        align-items: center;
+        gap: 1.1rem;
+        margin: 0.4rem 0 1.6rem 0;
+        padding-bottom: 1.1rem;
+        border-bottom: 1px solid rgba(255,255,255,0.15);
     }}
     .hero-logo img {{
-        width: 220px;
+        width: 108px;
+        display: block;
+    }}
+    .hero-text {{
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
     }}
     .hero-title {{
-        text-align: center;
-        font-size: 1.9rem;
+        text-align: left;
+        font-size: 1.7rem;
         font-weight: 700;
         letter-spacing: 0.02em;
         color: #ffffff;
-        margin-bottom: 0.2rem;
+        margin-bottom: 0.15rem;
+        line-height: 1.2;
     }}
     .hero-subtitle {{
-        text-align: center;
+        text-align: left;
         color: #a9c4cd;
-        margin-bottom: 1.6rem;
         font-size: 0.95rem;
     }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
@@ -168,11 +177,15 @@ st.markdown(
         border-radius: 10px !important;
     }}
     </style>
-    <div class="hero-logo">
-        <img src="data:image/png;base64,{JEPPESEN_LOGO_B64}" alt="Jeppesen ForeFlight logo">
+    <div class="hero-header">
+        <div class="hero-logo">
+            <img src="data:image/png;base64,{JEPPESEN_LOGO_B64}" alt="Jeppesen ForeFlight logo">
+        </div>
+        <div class="hero-text">
+            <div class="hero-title">ITP Sales Hub</div>
+            <div class="hero-subtitle">Trip support &amp; flight planning parsing, in one place</div>
+        </div>
     </div>
-    <div class="hero-title">ITP Sales Hub</div>
-    <div class="hero-subtitle">Trip support &amp; flight planning parsing, in one place</div>
     """,
     unsafe_allow_html=True,
 )
