@@ -99,10 +99,11 @@ st.markdown(
     }}
     /* "wide" removes Streamlit's narrow ~730px centered column; this
     caps it at a still-generous width instead of stretching content
-    edge-to-edge on large monitors. */
+    edge-to-edge on large monitors. Top padding is left at Streamlit's
+    own default (not overridden) so content clears the fixed toolbar
+    (Share/star/GitHub icons) instead of being cut off underneath it. */
     [data-testid="stAppViewContainer"] .block-container {{
         max-width: 1200px;
-        padding-top: 2.5rem;
         padding-left: 3rem;
         padding-right: 3rem;
         margin: 0 auto;
