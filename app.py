@@ -1,5 +1,5 @@
 """
-Trip Support Intake + Parsing -- combined app
+ITP Sales Hub -- combined intake + parsing app
 ================================================
 
 Landing screen lets the user pick which parsing task they want to run:
@@ -76,8 +76,14 @@ TASK_DESCRIPTIONS = {
     "Weekly Report": "Generate a weekly report.",
 }
 
-st.set_page_config(page_title="Trip Support Intake", page_icon="\U0001F4CB", layout="centered")
-st.title("Trip Support Intake")
+# Tasks that are visible on the landing screen but not selectable yet --
+# rendered grayed-out with a diagonal "on hold" banner instead of a
+# working card. Remove a task from this set once it's ready to build.
+DISABLED_TASKS = {"Weekly Report"}
+DISABLED_BANNER_TEXT = "Getting It Done"
+
+st.set_page_config(page_title="ITP Sales Hub", page_icon="\U0001F4CB", layout="centered")
+st.title("ITP Sales Hub")
 
 if "task" not in st.session_state:
     st.session_state["task"] = None
@@ -90,13 +96,40 @@ if st.session_state["task"] is None:
     cols = st.columns(len(TASKS))
     for col, task_name in zip(cols, TASKS):
         with col:
-            with st.container(border=True):
-                st.markdown(f"## {TASK_ICONS[task_name]}")
-                st.markdown(f"**{task_name}**")
-                st.caption(TASK_DESCRIPTIONS[task_name])
-                if st.button("Select", key=f"select_{task_name}", use_container_width=True):
-                    st.session_state["task"] = task_name
-                    st.rerun()
+            if task_name in DISABLED_TASKS:
+                st.markdown(
+                    f"""
+                    <div style="position:relative; overflow:hidden; border:1px solid #555;
+                                border-radius:8px; padding:16px; text-align:center;
+                                opacity:0.55; filter:grayscale(100%);">
+                        <div style="position:absolute; top:18px; right:-42px; width:170px;
+                                    transform:rotate(45deg); background:#7a7a7a; color:white;
+                                    text-align:center; font-size:11px; font-weight:700;
+                                    letter-spacing:0.4px; padding:4px 0;
+                                    box-shadow:0 2px 4px rgba(0,0,0,0.25);">
+                            {DISABLED_BANNER_TEXT}
+                        </div>
+                        <div style="font-size:2rem;">{TASK_ICONS[task_name]}</div>
+                        <div><strong>{task_name}</strong></div>
+                        <div style="font-size:0.85rem; color:#888; margin-top:4px;">
+                            {TASK_DESCRIPTIONS[task_name]}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.button(
+                    "Select", key=f"select_{task_name}", use_container_width=True,
+                    disabled=True, help="On hold for now.",
+                )
+            else:
+                with st.container(border=True):
+                    st.markdown(f"## {TASK_ICONS[task_name]}")
+                    st.markdown(f"**{task_name}**")
+                    st.caption(TASK_DESCRIPTIONS[task_name])
+                    if st.button("Select", key=f"select_{task_name}", use_container_width=True):
+                        st.session_state["task"] = task_name
+                        st.rerun()
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -295,21 +328,24 @@ if task == "Trip Preference Parsing":
                     st.info("Still processing -- click Refresh above to check again.")
 
 # ---------------------------------------------------------------------------
-# Flight Planning Parsing -- upload UI is live; extraction rules for this
-# document type haven't been defined yet (this is a different source
-# document than the Trip Support Service Preferences form, so it needs
-# its own field whitelist in parsing_engine.py before this can actually
-# process anything). Share a sample of a completed Flight Planning
-# Preferences form and the mapping gets built the same way the Trip
-# Preference pipeline was.
+# Flight Planning Parsing -- ON HOLD. Upload UI is live for later testing,
+# but wiring this up is paused for now. The target output design already
+# exists as flight_plan_template_output.html (the "Edit Flight Plan
+# Template" mock-up) -- once this resumes, extraction rules get defined
+# for the Flight Planning Preferences source document (a different form
+# than Trip Support Service Preferences, so it needs its own field
+# whitelist in parsing_engine.py), and the parsed values get mapped onto
+# that template's fields.
 # ---------------------------------------------------------------------------
 elif task == "Flight Planning Parsing":
     st.info(
         "This will parse a completed **Flight Planning Preferences** form and use "
-        "it to fill out the Flight Plan Template. The upload is wired up below, but "
-        "the extraction rules for this document haven't been defined yet -- share a "
-        "sample of a completed Flight Planning Preferences form and this gets built "
-        "out the same careful way the Trip Preference pipeline was."
+        "it to fill out the Flight Plan Template design already built "
+        "(flight_plan_template_output.html). This task is on hold for now -- the "
+        "upload below is wired up for later, but extraction rules haven't been "
+        "defined yet. When we pick this back up, share a sample of a completed "
+        "Flight Planning Preferences form and it gets built the same careful way "
+        "the Trip Preference pipeline was."
     )
 
     fp_uploaded_file = st.file_uploader(
