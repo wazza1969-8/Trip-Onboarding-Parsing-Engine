@@ -393,10 +393,22 @@ def list_weekly_report_periods(db_path: Path = DB_PATH) -> list[str]:
         conn.close()
 
 
+def _initials(name: str) -> str:
+    """'James O'Dwyer' -> 'JO', 'Pete Cowley' -> 'PC'. Takes the first
+    letter of each whitespace-separated word in the name, uppercased.
+    Note: this can collide if two team members share the same initials
+    (e.g. two "J.D." people) -- there's no dedup here since the roster
+    is small and manually managed."""
+    parts = [p for p in name.strip().split() if p]
+    return "".join(p[0].upper() for p in parts)
+
+
 def compile_weekly_report_text(period: str, db_path: Path = DB_PATH, expected_submitters: list[str] | None = None) -> str:
     """Groups every submission for a period by category into one
     plain-text report, formatted to be readable pasted directly into an
-    email body."""
+    email body. Each bullet is rendered on its own line as
+    '* <text> (INITIALS)' rather than grouped under the person's full
+    name, per the requested format."""
     rows = list_weekly_reports_for_period(period, db_path)
     lines = [f"WEEKLY TEAM REPORT -- {period_label(period)}", ""]
 
@@ -409,16 +421,15 @@ def compile_weekly_report_text(period: str, db_path: Path = DB_PATH, expected_su
             lines.append(label.upper())
             if entries:
                 for name, text in entries:
+                    initials = _initials(name)
                     # Each submission is stored as one bullet per line (from
                     # the UI's "+ Add entry" boxes) -- render every bullet
-                    # as its own sub-line under that person's name.
+                    # as its own "* ... (INITIALS)" line.
                     bullets = [b.strip() for b in text.split("\n") if b.strip()]
-                    if len(bullets) <= 1:
-                        lines.append(f"  - {name}: {bullets[0] if bullets else text}")
-                    else:
-                        lines.append(f"  - {name}:")
-                        for bullet in bullets:
-                            lines.append(f"      - {bullet}")
+                    if not bullets:
+                        bullets = [text]
+                    for bullet in bullets:
+                        lines.append(f"* {bullet} ({initials})")
             else:
                 lines.append("  (nothing reported)")
             lines.append("")
