@@ -11,10 +11,9 @@ Landing screen lets the user pick which parsing task they want to run:
     see the note in that section below.
   - Weekly Report: team members submit their update for the current
     week under a fixed set of categories; a manager compiles everyone's
-    submissions into one report, ready to copy into an email or
-    download. Actually sending email isn't wired up yet -- pick an
-    email method (Gmail app password, company SMTP, or a transactional
-    API like SendGrid) and that's a small follow-on to add.
+    submissions into one report and can send it by email with one
+    click (via Gmail's SMTP relay -- see GMAIL_ADDRESS/GMAIL_APP_PASSWORD
+    in secrets.toml), or copy/download it instead.
 
 Every Trip Preference Parsing submission becomes a row in a local
 SQLite database (requests.db, created next to backend.py) with a short
@@ -847,9 +846,29 @@ elif task == "Weekly Report":
             key="wr_download_btn",
         )
 
-        st.info(
-            "Sending isn't automated yet -- copy the report above into an email to "
-            "the recipients listed, or let me know which email method you want to "
-            "use (Gmail app password, company SMTP, or a service like SendGrid) "
-            "and this can send automatically with one click."
-        )
+        st.markdown("**Send by email**")
+        gmail_configured = bool(st.secrets.get("GMAIL_ADDRESS")) and bool(st.secrets.get("GMAIL_APP_PASSWORD"))
+        if not gmail_configured:
+            st.info(
+                "Email sending isn't configured yet. Add `GMAIL_ADDRESS` and "
+                "`GMAIL_APP_PASSWORD` (a Gmail **App Password**, not your regular "
+                "Gmail password) to this app's secrets, and this button will send "
+                "automatically from then on. Until then, copy the report above "
+                "into an email."
+            )
+        elif not recipients:
+            st.info("Add at least one recipient above before sending.")
+        else:
+            if st.button("Send report now", key="wr_send_btn", type="primary"):
+                subject = f"Weekly Team Report -- {backend.period_label(period_to_compile)}"
+                try:
+                    with st.spinner("Sending..."):
+                        backend.send_weekly_report_email(
+                            recipients=recipients,
+                            subject=subject,
+                            body=report_text,
+                            secrets_getter=lambda: st.secrets,
+                        )
+                    st.success(f"Sent to {len(recipients)} recipient(s).")
+                except (ValueError, RuntimeError) as e:
+                    st.error(str(e))

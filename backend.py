@@ -505,6 +505,69 @@ def import_recipients_json(json_text: str, db_path: Path = DB_PATH) -> tuple[int
     return added, skipped
 
 
+def send_weekly_report_email(
+    recipients: list[str],
+    subject: str,
+    body: str,
+    secrets_getter=None,
+) -> None:
+    """Sends the compiled weekly report by email via Gmail's SMTP relay.
+
+    secrets_getter: optional callable returning a dict-like of secrets
+    (e.g. st.secrets), same injectable-dependency pattern as
+    get_anthropic_client() above, so this stays testable without
+    importing streamlit here.
+
+    Required secrets:
+      GMAIL_ADDRESS      -- the Gmail account emails are sent from.
+      GMAIL_APP_PASSWORD -- a 16-character Gmail App Password, NOT the
+                             normal account password. Generate one at
+                             myaccount.google.com/apppasswords (requires
+                             2-Step Verification to be turned on first).
+
+    Recipients are validated email addresses (already checked by
+    add_recipient()), so no further sanitization of the address list is
+    needed here. The connection uses SMTP over SSL/TLS on port 465 with
+    certificate verification -- never plaintext SMTP.
+    """
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+
+    recipients = [r.strip() for r in (recipients or []) if r and r.strip()]
+    if not recipients:
+        raise ValueError("Add at least one recipient before sending.")
+
+    sender = _get_secret(secrets_getter, "GMAIL_ADDRESS")
+    app_password = _get_secret(secrets_getter, "GMAIL_APP_PASSWORD")
+    if not sender or not app_password:
+        raise RuntimeError(
+            "Email sending isn't configured yet. Add GMAIL_ADDRESS and "
+            "GMAIL_APP_PASSWORD to this app's secrets first."
+        )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=20) as server:
+            server.login(sender, app_password)
+            server.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        # Never surface the password itself -- just point at what to check.
+        raise RuntimeError(
+            "Gmail rejected the login. Double-check GMAIL_ADDRESS and make "
+            "sure GMAIL_APP_PASSWORD is a 16-character App Password (not "
+            "your regular Gmail password)."
+        ) from e
+    except (smtplib.SMTPException, OSError) as e:
+        raise RuntimeError(f"Couldn't send the email: {e}") from e
+
+
 def insert_request(fields: dict, db_path: Path = DB_PATH) -> str:
     request_id = uuid.uuid4().hex[:8].upper()
     conn = get_conn(db_path)
