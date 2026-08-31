@@ -2,3 +2,4 @@ streamlit
 anthropic[bedrock]
 pymupdf
 openpyxl
+pillow
