@@ -70,6 +70,134 @@ WEEKLY_REPORT_CATEGORY_ICONS = {
     "other": "\U0001F4DD",            # memo
 }
 
+
+def render_editable_report_form(submitter: str, period_id: str, key_prefix: str) -> None:
+    """The dynamic add/remove bullet-point editor for one submitter's
+    report in one period. Shared by the "Submit My Report" tab (editing
+    "your own" report, key_prefix="wr") and the "View All Reports" tab
+    (a manager creating/editing someone else's report, key_prefix
+    scoped per row) so both use the exact same widget behavior and the
+    exact same backend.upsert_weekly_report() write path -- including
+    its server-side edit-cutoff check. `key_prefix` keeps the two call
+    sites' widget keys from colliding if both were ever open in the
+    same session.
+
+    Caller is responsible for only invoking this when
+    backend.is_period_editable() is true for this period; the actual
+    save is still re-validated server-side regardless, in case the
+    period locks between page load and the Submit click.
+    """
+    existing = backend.get_weekly_report(submitter, period_id)
+    if existing:
+        st.caption("A report already exists for this period -- editing and submitting again will update it.")
+
+    # Bullet widget state is only (re)loaded from the saved report when
+    # the submitter being edited changes -- not on every rerun -- so
+    # add/remove clicks don't wipe unsaved edits.
+    load_marker_key = f"{key_prefix}_loaded_for_{period_id}"
+    if st.session_state.get(load_marker_key) != submitter:
+        for key, _ in backend.WEEKLY_REPORT_CATEGORIES:
+            saved_text = existing[key] if existing and existing[key] else ""
+            saved_lines = [ln.strip() for ln in saved_text.split("\n") if ln.strip()]
+            new_ids = []
+            for line in saved_lines:
+                item_id = uuid.uuid4().hex[:8]
+                st.session_state[f"{key_prefix}_{key}_{item_id}"] = line
+                new_ids.append(item_id)
+            st.session_state[f"{key_prefix}_{key}_ids"] = new_ids
+        st.session_state[load_marker_key] = submitter
+
+    values = {}
+    for key, label in backend.WEEKLY_REPORT_CATEGORIES:
+        icon = WEEKLY_REPORT_CATEGORY_ICONS.get(key, "•")
+        ids_key = f"{key_prefix}_{key}_ids"
+        if ids_key not in st.session_state:
+            st.session_state[ids_key] = []
+        item_ids = st.session_state[ids_key]
+
+        with st.container(border=True):
+            count = len(item_ids)
+            st.markdown(
+                f"##### {icon} {label} &nbsp; "
+                f":gray[({count} {'entry' if count == 1 else 'entries'})]"
+            )
+
+            if not item_ids:
+                st.caption("No entries yet -- click “+ Add entry” to add your first bullet point.")
+
+            # Important: don't call st.rerun() from inside this loop.
+            # Streamlit only keeps a widget's value if that widget
+            # gets (re-)rendered during the run; rerun() aborts the
+            # script immediately, so any row after the one clicked
+            # would never render this pass and would lose its text.
+            # So every row's widget always renders first, and the
+            # delete is only actioned -- and rerun() only called --
+            # once the whole loop has finished.
+            pending_delete_id = None
+            for item_id in list(item_ids):
+                # Each row gets its own explicitly-keyed container so
+                # Streamlit tracks its widgets by that key rather
+                # than by position.
+                with st.container(key=f"{key_prefix}_{key}_row_{item_id}"):
+                    col_bullet, col_text, col_del = st.columns([0.05, 0.85, 0.10])
+                    with col_bullet:
+                        st.markdown(
+                            "<div style='font-size:1.6rem; line-height:2.4rem; "
+                            "color:#5fd0e8; text-align:center;'>&bull;</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with col_text:
+                        st.text_input(
+                            label,
+                            label_visibility="collapsed",
+                            key=f"{key_prefix}_{key}_{item_id}",
+                            placeholder=f"Add a {label.split(' / ')[0].lower()} entry...",
+                        )
+                    with col_del:
+                        if st.button("✕", key=f"{key_prefix}_{key}_del_{item_id}", help="Remove this entry"):
+                            pending_delete_id = item_id
+
+            if pending_delete_id is not None:
+                st.session_state[ids_key] = [i for i in st.session_state[ids_key] if i != pending_delete_id]
+                st.session_state.pop(f"{key_prefix}_{key}_{pending_delete_id}", None)
+                st.rerun()
+
+            if st.button("+ Add entry", key=f"{key_prefix}_{key}_add_btn"):
+                new_id = uuid.uuid4().hex[:8]
+                st.session_state[ids_key] = st.session_state[ids_key] + [new_id]
+                st.session_state[f"{key_prefix}_{key}_{new_id}"] = ""
+                st.rerun()
+
+        bullet_texts = [st.session_state.get(f"{key_prefix}_{key}_{i}", "").strip() for i in st.session_state[ids_key]]
+        values[key] = "\n".join(t for t in bullet_texts if t)
+
+    if st.button("Submit report", key=f"{key_prefix}_submit_btn", type="primary"):
+        try:
+            backend.upsert_weekly_report(submitter, period_id, values)
+            st.toast(f"Saved the report for {submitter}.")
+            st.rerun()
+        except backend.PeriodLockedError as e:
+            st.error(str(e))
+
+
+def render_report_readonly(row) -> None:
+    """Read-only rendering of one submitted report -- used for locked
+    (past-cutoff) reports, which must remain viewable even though
+    they're no longer editable. Mirrors the editable form's container/
+    icon/label layout so the visual design stays consistent, just with
+    plain bulleted text instead of editable rows."""
+    for key, label in backend.WEEKLY_REPORT_CATEGORIES:
+        icon = WEEKLY_REPORT_CATEGORY_ICONS.get(key, "•")
+        text = (row[key] if row and row[key] else "").strip()
+        bullets = [b.strip() for b in text.split("\n") if b.strip()]
+        with st.container(border=True):
+            st.markdown(f"##### {icon} {label}")
+            if bullets:
+                for b in bullets:
+                    st.markdown(f"- {b}")
+            else:
+                st.caption("Nothing reported.")
+
 # The salesperson list itself lives in the database (backend.py's
 # salespeople table) so it can be edited from the UI -- see the
 # "Manage salesperson list" expander inside Trip Preference Parsing.
@@ -564,15 +692,49 @@ elif task == "Flight Planning Parsing":
     )
 
 # ---------------------------------------------------------------------------
-# Weekly Report -- team members submit their update for the current
-# period under WEEKLY_REPORT_CATEGORIES (backend.py); "Compile Weekly
-# Report" groups every submission for a chosen period into one report.
-# Actually emailing it out isn't wired up yet -- the compiled report is
-# a copy/download only, ready to paste into an email once a sending
-# method (Gmail app password / company SMTP / SendGrid etc.) is picked.
+# Weekly Report -- one shared Period selector (always the current period
+# plus two weeks before/after -- see backend.available_periods()) drives
+# all three tabs below:
+#   - Submit My Report: create/edit your own report for the selected
+#     period. Locked automatically once that period's edit cutoff has
+#     passed -- see backend.is_period_editable().
+#   - View All Reports: every team member's status/timestamps for the
+#     selected period, with inline View/Edit/Create per person.
+#   - Compile Weekly Report: groups every submission for the selected
+#     period into one report, ready to email (Gmail SMTP), copy, or
+#     download.
+# render_editable_report_form() and render_report_readonly() below are
+# shared by both the Submit tab and the View All Reports tab so the
+# create/edit UI and the lock rule behave identically everywhere.
 # ---------------------------------------------------------------------------
 elif task == "Weekly Report":
-    tab_submit, tab_compile = st.tabs(["Submit My Report", "Compile Weekly Report"])
+    wr_tz = backend.get_business_timezone()
+    wr_current_monday = backend.current_period_monday(wr_tz)
+    wr_period_mondays = backend.available_periods(wr_tz)
+    wr_period_options = [backend.period_id_from_monday(m) for m in wr_period_mondays]
+    wr_current_period_id = backend.period_id_from_monday(wr_current_monday)
+
+    # Default to the current period on first load; if a previously
+    # selected period has rolled outside the 5-period window (e.g. the
+    # browser tab was left open for a few weeks), fall back to current
+    # rather than getting stuck on an option that no longer exists.
+    if st.session_state.get("wr_selected_period") not in wr_period_options:
+        st.session_state["wr_selected_period"] = wr_current_period_id
+
+    selected_period_id = st.selectbox(
+        "Reporting period",
+        options=wr_period_options,
+        format_func=lambda pid: backend.format_period_label(
+            backend.monday_from_period_id(pid), is_current=(pid == wr_current_period_id)
+        ),
+        key="wr_selected_period",
+    )
+    selected_monday = backend.monday_from_period_id(selected_period_id)
+    period_editable = backend.is_period_editable(selected_monday)
+
+    tab_submit, tab_view, tab_compile = st.tabs(
+        ["Submit My Report", "View All Reports", "Compile Weekly Report"]
+    )
 
     with tab_submit:
         team = backend.list_report_team_members()
@@ -650,108 +812,89 @@ elif task == "Weekly Report":
             st.warning("No team members configured yet. Add names above before submitting a report.")
         else:
             submitter = st.selectbox("Your name", team, key="wr_submitter")
-            period = backend.current_period()
-            st.caption(f"Reporting period: {backend.period_label(period)}")
+            is_current = selected_monday == wr_current_monday
+            st.caption(
+                f"Reporting period: {backend.format_period_label(selected_monday, is_current=is_current)}"
+            )
 
-            existing = backend.get_weekly_report(submitter, period)
-            if existing:
-                st.caption("You've already submitted for this period -- editing and submitting again will update it.")
+            if period_editable:
+                render_editable_report_form(submitter, selected_period_id, key_prefix="wr")
+            else:
+                cutoff = backend.edit_cutoff(selected_monday)
+                st.info(
+                    f"This period locked on {cutoff.strftime('%b %d, %Y')} at "
+                    f"{cutoff.strftime('%I:%M %p %Z')} and can no longer be edited."
+                )
+                existing = backend.get_weekly_report(submitter, selected_period_id)
+                if existing:
+                    render_report_readonly(existing)
+                else:
+                    st.caption(f"No report was submitted by {submitter} for this period.")
 
-            # Each category starts with zero bullet-point boxes; "+ Add
-            # entry" appends one, the X removes one. Bullet widget state
-            # is only (re)loaded from the saved report when the selected
-            # submitter changes -- not on every rerun -- so add/remove
-            # clicks don't wipe unsaved edits.
-            load_marker_key = f"wr_loaded_for_{period}"
-            if st.session_state.get(load_marker_key) != submitter:
-                for key, _ in backend.WEEKLY_REPORT_CATEGORIES:
-                    saved_text = existing[key] if existing and existing[key] else ""
-                    saved_lines = [ln.strip() for ln in saved_text.split("\n") if ln.strip()]
-                    new_ids = []
-                    for line in saved_lines:
-                        item_id = uuid.uuid4().hex[:8]
-                        st.session_state[f"wr_{key}_{item_id}"] = line
-                        new_ids.append(item_id)
-                    st.session_state[f"wr_{key}_ids"] = new_ids
-                st.session_state[load_marker_key] = submitter
+    with tab_view:
+        team = backend.list_report_team_members()
 
-            values = {}
-            for key, label in backend.WEEKLY_REPORT_CATEGORIES:
-                icon = WEEKLY_REPORT_CATEGORY_ICONS.get(key, "•")
-                ids_key = f"wr_{key}_ids"
-                if ids_key not in st.session_state:
-                    st.session_state[ids_key] = []
-                item_ids = st.session_state[ids_key]
+        if not team:
+            st.info("No team members configured yet -- add some in the Submit My Report tab.")
+        else:
+            rows_by_submitter = {
+                r["submitter"]: r for r in backend.list_weekly_reports_for_period(selected_period_id)
+            }
+            submitted_count = sum(1 for name in team if name in rows_by_submitter)
+            st.caption(f"{submitted_count} of {len(team)} team members submitted for this period.")
+            if submitted_count == 0:
+                st.info("No reports have been submitted yet for this period.")
 
+            active = st.session_state.get("wrview_active")
+
+            for idx, name in enumerate(team):
+                row = rows_by_submitter.get(name)
                 with st.container(border=True):
-                    count = len(item_ids)
-                    st.markdown(
-                        f"##### {icon} {label} &nbsp; "
-                        f":gray[({count} {'entry' if count == 1 else 'entries'})]"
+                    col_name, col_status, col_submitted, col_updated, col_action = st.columns(
+                        [0.26, 0.16, 0.19, 0.19, 0.20]
                     )
+                    with col_name:
+                        st.markdown(f"**{name}**")
+                    with col_status:
+                        st.markdown("🟢 Submitted" if row else "⚪ Not submitted")
+                    with col_submitted:
+                        st.caption(backend.format_timestamp(row["submitted_at"]) if row else "—")
+                    with col_updated:
+                        st.caption(backend.format_timestamp(row["updated_at"]) if row else "—")
+                    with col_action:
+                        if row and period_editable:
+                            if st.button("Edit", key=f"wrview_edit_btn_{idx}"):
+                                st.session_state["wrview_active"] = (name, "edit")
+                                st.rerun()
+                        elif row and not period_editable:
+                            if st.button("View", key=f"wrview_view_btn_{idx}"):
+                                st.session_state["wrview_active"] = (name, "view")
+                                st.rerun()
+                        elif not row and period_editable:
+                            if st.button("Create", key=f"wrview_create_btn_{idx}"):
+                                st.session_state["wrview_active"] = (name, "edit")
+                                st.rerun()
+                        else:
+                            st.caption("Locked")
 
-                    if not item_ids:
-                        st.caption("No entries yet -- click “+ Add entry” to add your first bullet point.")
-
-                    # Important: don't call st.rerun() from inside this loop.
-                    # Streamlit only keeps a widget's value if that widget
-                    # gets (re-)rendered during the run; rerun() aborts the
-                    # script immediately, so any row after the one clicked
-                    # would never render this pass and would lose its text.
-                    # So every row's widget always renders first, and the
-                    # delete is only actioned -- and rerun() only called --
-                    # once the whole loop has finished.
-                    pending_delete_id = None
-                    for item_id in list(item_ids):
-                        # Each row gets its own explicitly-keyed container so
-                        # Streamlit tracks its widgets by that key rather
-                        # than by position.
-                        with st.container(key=f"wr_{key}_row_{item_id}"):
-                            col_bullet, col_text, col_del = st.columns([0.05, 0.85, 0.10])
-                            with col_bullet:
-                                st.markdown(
-                                    "<div style='font-size:1.6rem; line-height:2.4rem; "
-                                    "color:#5fd0e8; text-align:center;'>&bull;</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            with col_text:
-                                st.text_input(
-                                    label,
-                                    label_visibility="collapsed",
-                                    key=f"wr_{key}_{item_id}",
-                                    placeholder=f"Add a {label.split(' / ')[0].lower()} entry...",
-                                )
-                            with col_del:
-                                if st.button("✕", key=f"wr_{key}_del_{item_id}", help="Remove this entry"):
-                                    pending_delete_id = item_id
-
-                    if pending_delete_id is not None:
-                        st.session_state[ids_key] = [i for i in st.session_state[ids_key] if i != pending_delete_id]
-                        st.session_state.pop(f"wr_{key}_{pending_delete_id}", None)
-                        st.rerun()
-
-                    if st.button("+ Add entry", key=f"wr_{key}_add_btn"):
-                        new_id = uuid.uuid4().hex[:8]
-                        st.session_state[ids_key] = st.session_state[ids_key] + [new_id]
-                        st.session_state[f"wr_{key}_{new_id}"] = ""
-                        st.rerun()
-
-                bullet_texts = [st.session_state.get(f"wr_{key}_{i}", "").strip() for i in st.session_state[ids_key]]
-                values[key] = "\n".join(t for t in bullet_texts if t)
-
-            if st.button("Submit report", key="wr_submit_btn"):
-                backend.upsert_weekly_report(submitter, period, values)
-                st.toast(f"Saved your report for {submitter}.")
-                st.rerun()
+                    if active and active[0] == name:
+                        _, mode = active
+                        st.markdown("---")
+                        if mode == "edit" and period_editable:
+                            render_editable_report_form(name, selected_period_id, key_prefix=f"wrview_{idx}")
+                        elif row:
+                            render_report_readonly(row)
+                        else:
+                            st.caption("No report was submitted for this period.")
+                        if st.button("Close", key=f"wrview_close_btn_{idx}"):
+                            st.session_state.pop("wrview_active", None)
+                            st.rerun()
 
     with tab_compile:
-        periods = backend.list_weekly_report_periods()
-        current = backend.current_period()
-        if current not in periods:
-            periods = [current] + periods
-
-        period_to_compile = st.selectbox(
-            "Period", periods, index=0, key="wr_compile_period", format_func=backend.period_label,
+        period_to_compile = selected_period_id
+        st.caption(
+            f"Compiling: {backend.format_period_label(selected_monday, is_current=(selected_monday == wr_current_monday))} "
+            "-- change the period at the top of the page to compile a different week."
         )
 
         team = backend.list_report_team_members()

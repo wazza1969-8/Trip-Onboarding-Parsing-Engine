@@ -9,11 +9,13 @@ a live Streamlit runtime context.
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import parsing_engine as pe
 
@@ -102,7 +104,53 @@ def get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
             name TEXT UNIQUE NOT NULL COLLATE NOCASE
         )"""
     )
+    _migrate_legacy_period_format(conn)
     return conn
+
+
+def _migrate_legacy_period_format(conn: sqlite3.Connection) -> None:
+    """One-time, idempotent data migration.
+
+    weekly_reports.period used to store an ISO-week code (e.g.
+    "2026-W36"). The canonical period identifier is now that period's
+    Monday as an ISO date (e.g. "2026-08-31") -- see the period helpers
+    below (period_id_from_monday / monday_from_period_id). This avoids
+    ever comparing or storing periods as a formatted display label,
+    keeps the identifier trivially sortable and unambiguous across
+    year boundaries, and matches the "Monday start date is canonical"
+    rule directly instead of only in spirit.
+
+    Safe to call on every connection: it only rewrites rows still in
+    the old "YYYY-Www" format (matched with a regex, not just "looks
+    like it has a W in it") and does nothing once they're migrated.
+    No rows are dropped; only the `period` value is reformatted, so
+    submitted_at/updated_at/created content are untouched.
+    """
+    legacy_pattern = re.compile(r"^\d{4}-W\d{2}$")
+    rows = conn.execute("SELECT DISTINCT period FROM weekly_reports").fetchall()
+    for (old_period,) in rows:
+        if not old_period or not legacy_pattern.match(old_period):
+            continue
+        try:
+            year_str, week_str = old_period.split("-W")
+            monday = date.fromisocalendar(int(year_str), int(week_str), 1)
+        except (ValueError, IndexError):
+            continue
+        new_period = monday.isoformat()
+        if new_period == old_period:
+            continue
+        try:
+            conn.execute(
+                "UPDATE weekly_reports SET period = ? WHERE period = ?",
+                (new_period, old_period),
+            )
+        except sqlite3.IntegrityError:
+            # A row for (submitter, new_period) already exists for some
+            # submitter -- extremely unlikely (the new format was never
+            # writable before this migration existed), but fail safe by
+            # leaving the legacy row in place rather than losing data.
+            continue
+    conn.commit()
 
 
 def _now() -> str:
@@ -300,40 +348,241 @@ def import_report_team_members_json(json_text: str, db_path: Path = DB_PATH) -> 
 
 
 # ---------------------------------------------------------------------------
-# Weekly Report -- team members submit their update for the current
-# period (an ISO week, e.g. "2026-W35") under a fixed set of categories
-# (WEEKLY_REPORT_CATEGORIES above); a manager then compiles everyone's
-# submissions for a period into one report, ready to copy into an email
-# or download. Sending isn't wired up yet -- see compile_weekly_report_text().
+# Weekly Report -- team members submit their update for a reporting
+# period under a fixed set of categories (WEEKLY_REPORT_CATEGORIES
+# above); a manager then compiles everyone's submissions for a period
+# into one report, ready to email, copy, or download.
+#
+# PERIODS AND TIMEZONE
+# ---------------------
+# A reporting period is always Monday-Sunday. Its Monday (a `date`) is
+# the single canonical identifier for a period everywhere in this
+# module and in app.py -- see period_id_from_monday() /
+# monday_from_period_id(). Formatted strings like "Aug 31-Sep 6, 2026"
+# (format_period_label) or "Week of Aug 24-Aug 30, 2026" (period_label,
+# kept for the existing compiled-report header/email subject) are for
+# display only and are never stored or compared.
+#
+# "Current period", "now", and every edit-cutoff check below are all
+# computed from server time in BUSINESS_TIMEZONE (see
+# get_business_timezone()) -- never from a value supplied by the
+# caller/browser. is_period_editable() is the single source of truth
+# for the create/edit business rule and is used by both the UI (to
+# show/hide the edit form) and upsert_weekly_report() (to actually
+# reject a write) -- see that function's docstring for the rule.
 # ---------------------------------------------------------------------------
+
+# The business timezone used for every period/cutoff calculation.
+# Override by adding BUSINESS_TIMEZONE to this app's secrets/env (any
+# IANA zone name, e.g. "America/New_York") if your team isn't in
+# Mountain Time. Defaults to Jeppesen ForeFlight's Englewood, CO
+# headquarters timezone -- confirm this is correct for your team; it's
+# an assumption, not a fact discovered from your data.
+DEFAULT_BUSINESS_TIMEZONE = "America/Denver"
+
+
+def get_business_timezone(secrets_getter=None) -> ZoneInfo:
+    """The single configured business timezone -- see
+    DEFAULT_BUSINESS_TIMEZONE above for how to override it. Falls back
+    to the default if the configured name isn't a valid IANA zone."""
+    name = _get_secret(secrets_getter, "BUSINESS_TIMEZONE") or DEFAULT_BUSINESS_TIMEZONE
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo(DEFAULT_BUSINESS_TIMEZONE)
+
+
+def _monday_of(d: date) -> date:
+    """The Monday on or before `d` -- the start of d's Mon-Sun period."""
+    return d - timedelta(days=d.weekday())  # Monday == weekday() 0
+
+
+def current_period_monday(tz: ZoneInfo | None = None, now: datetime | None = None) -> date:
+    """The Monday of the period containing "now" in the business
+    timezone. `now` defaults to real server time -- only tests should
+    pass it explicitly."""
+    tz = tz or get_business_timezone()
+    now = now or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    return _monday_of(now.astimezone(tz).date())
+
+
+def period_id_from_monday(monday: date) -> str:
+    """Canonical period identifier: the period's Monday as an ISO date
+    (e.g. "2026-08-31"). This is what's stored in weekly_reports.period
+    and passed to every function below that takes a `period` string."""
+    return monday.isoformat()
+
+
+def monday_from_period_id(period_id: str) -> date:
+    """Inverse of period_id_from_monday(). Also accepts the legacy
+    ISO-week identifier (e.g. "2026-W36") for any caller that still
+    has one in hand -- the stored data itself is migrated by
+    _migrate_legacy_period_format(), but this keeps the parser honest
+    either way."""
+    try:
+        return date.fromisoformat(period_id)
+    except ValueError:
+        pass
+    year_str, week_str = period_id.split("-W")
+    return date.fromisocalendar(int(year_str), int(week_str), 1)
+
+
+def available_periods(tz: ZoneInfo | None = None, now: datetime | None = None) -> list[date]:
+    """The five Mondays for the Period dropdown: two weeks before the
+    current period, one week before, the current period, one week
+    after, and two weeks after -- in that order."""
+    current_monday = current_period_monday(tz, now)
+    return [current_monday + timedelta(weeks=offset) for offset in (-2, -1, 0, 1, 2)]
+
+
+def format_period_label(monday: date, is_current: bool = False) -> str:
+    """The Period dropdown's display label, e.g. 'Aug 17-23, 2026',
+    'Aug 31-Sep 6, 2026' (month boundary), 'Dec 29, 2025-Jan 4, 2026'
+    (year boundary), optionally suffixed ' -- Current'. Day numbers are
+    never zero-padded (e.g. 'Sep 6', not 'Sep 06')."""
+
+    def month_day(d: date) -> str:
+        return f"{d.strftime('%b')} {d.day}"
+
+    sunday = monday + timedelta(days=6)
+    if monday.year != sunday.year:
+        label = f"{month_day(monday)}, {monday.year}–{month_day(sunday)}, {sunday.year}"
+    elif monday.month != sunday.month:
+        label = f"{month_day(monday)}–{month_day(sunday)}, {sunday.year}"
+    else:
+        label = f"{month_day(monday)}–{sunday.day}, {sunday.year}"
+    return f"{label} — Current" if is_current else label
+
+
+def edit_cutoff(monday: date, tz: ZoneInfo | None = None) -> datetime:
+    """The instant a period locks: 11:59:59 PM on the Monday following
+    the period's Sunday (one full calendar day of grace after the
+    period ends), in the business timezone."""
+    tz = tz or get_business_timezone()
+    following_monday = monday + timedelta(days=7)
+    return datetime.combine(following_monday, time(23, 59, 59), tzinfo=tz)
+
+
+def is_period_editable(monday: date, tz: ZoneInfo | None = None, now: datetime | None = None) -> bool:
+    """Single source of truth for the create/edit business rule:
+
+      - Outside the 5-period rolling window (more than 2 weeks before
+        or after the current period): never editable. This is a
+        defense-in-depth bound -- it rejects a crafted/stale period
+        value that was never actually offered in the dropdown, even
+        though the cutoff rule alone would already block old periods.
+      - Current or future period (within the window): always editable.
+      - Past period (within the window): editable only until
+        edit_cutoff() -- Monday 11:59:59 PM the week after it ends.
+
+    `now`/`tz` default to real server time in the business timezone --
+    only tests should pass them explicitly. This function (not the
+    caller's clock) is what upsert_weekly_report() checks before every
+    write, so disabling a button in the UI is never the only guard.
+    """
+    tz = tz or get_business_timezone()
+    now = now or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    now = now.astimezone(tz)
+
+    current_monday = current_period_monday(tz, now)
+    earliest = current_monday - timedelta(weeks=2)
+    latest = current_monday + timedelta(weeks=2)
+    if monday < earliest or monday > latest:
+        return False
+    if monday >= current_monday:
+        return True
+    return now < edit_cutoff(monday, tz)
+
+
+class PeriodLockedError(RuntimeError):
+    """Raised when a create/edit is rejected because its reporting
+    period is no longer editable. Always raised from server-side code
+    (upsert_weekly_report), using server time -- never bypassed by a
+    stale browser tab or a disabled-but-not-actually-enforced button."""
+
+
 def current_period(on_date: date | None = None) -> str:
-    d = on_date or datetime.now(timezone.utc).date()
-    iso_year, iso_week, _ = d.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}"
+    """Back-compat wrapper: returns the canonical period identifier
+    (Monday ISO date) for `on_date`, or for "now" in the business
+    timezone if not given. Prefer current_period_monday() directly in
+    new code."""
+    tz = get_business_timezone()
+    monday = _monday_of(on_date) if on_date is not None else current_period_monday(tz)
+    return period_id_from_monday(monday)
 
 
 def period_label(period: str) -> str:
-    """Turns 'YYYY-Www' into a human-readable date range, e.g.
-    'Week of Aug 24 - Aug 30, 2026'. Falls back to the raw string if it
-    doesn't parse."""
+    """Turns a period identifier into 'Week of Aug 24-Aug 30, 2026' --
+    used in the compiled report header and email subject line. Accepts
+    both the canonical Monday-date identifier and the legacy ISO-week
+    identifier (via monday_from_period_id()). For the Period dropdown's
+    own label format ('Aug 17-23, 2026'), use format_period_label()
+    instead."""
     try:
-        year_str, week_str = period.split("-W")
-        monday = date.fromisocalendar(int(year_str), int(week_str), 1)
-        sunday = date.fromisocalendar(int(year_str), int(week_str), 7)
-        if monday.month == sunday.month:
-            return f"Week of {monday.strftime('%b %d')}-{sunday.strftime('%d, %Y')}"
-        return f"Week of {monday.strftime('%b %d')} - {sunday.strftime('%b %d, %Y')}"
+        monday = monday_from_period_id(period)
     except (ValueError, IndexError):
         return period
+    sunday = monday + timedelta(days=6)
+    if monday.month == sunday.month:
+        return f"Week of {monday.strftime('%b %d')}-{sunday.strftime('%d, %Y')}"
+    return f"Week of {monday.strftime('%b %d')} - {sunday.strftime('%b %d, %Y')}"
 
 
-def upsert_weekly_report(submitter: str, period: str, values: dict, db_path: Path = DB_PATH) -> None:
+def format_timestamp(iso_utc: str | None, tz: ZoneInfo | None = None) -> str:
+    """Formats a stored UTC ISO-8601 timestamp (as produced by _now())
+    into the business timezone for display, e.g.
+    '2026-08-31T21:05:33+00:00' -> 'Aug 31, 2026 03:05 PM'. Returns an
+    em dash for a missing value, and falls back to the raw string if
+    it doesn't parse (defensive -- shouldn't happen with our own
+    _now() output)."""
+    if not iso_utc:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        tz = tz or get_business_timezone()
+        return dt.astimezone(tz).strftime("%b %d, %Y %I:%M %p")
+    except ValueError:
+        return iso_utc
+
+
+def upsert_weekly_report(
+    submitter: str,
+    period: str,
+    values: dict,
+    db_path: Path = DB_PATH,
+    tz: ZoneInfo | None = None,
+    now: datetime | None = None,
+) -> None:
     """Saves (or overwrites) one submitter's report for one period. Safe
     to call again for the same submitter/period -- e.g. if they come
-    back to edit before the report gets compiled."""
+    back to edit before the report gets compiled.
+
+    Server-side enforcement of the edit-cutoff rule lives here, not
+    just in the UI: this re-checks is_period_editable() using server
+    time before writing anything, and raises PeriodLockedError if the
+    period has locked since the page was loaded (e.g. a stale browser
+    tab open past the Monday cutoff). `tz`/`now` are only for tests --
+    real callers should never pass them, so this always uses actual
+    server time.
+    """
     submitter = (submitter or "").strip()
     if not submitter:
         raise ValueError("Select your name before submitting.")
+
+    monday = monday_from_period_id(period)
+    if not is_period_editable(monday, tz=tz, now=now):
+        raise PeriodLockedError(
+            f"The reporting period {format_period_label(monday)} is locked and "
+            "can no longer be edited or created (editing closes at 11:59 PM "
+            "the Monday after the period ends). Your changes were not saved."
+        )
+
     cols = [key for key, _ in WEEKLY_REPORT_CATEGORIES]
     now = _now()
     conn = get_conn(db_path)
