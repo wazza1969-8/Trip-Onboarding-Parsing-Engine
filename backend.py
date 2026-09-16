@@ -535,21 +535,14 @@ def available_periods(tz: ZoneInfo | None = None, now: datetime | None = None) -
 
 
 def format_period_label(monday: date, is_current: bool = False) -> str:
-    """The Period dropdown's display label, e.g. 'Aug 17-23, 2026',
-    'Aug 31-Sep 6, 2026' (month boundary), 'Dec 29, 2025-Jan 4, 2026'
-    (year boundary), optionally suffixed ' -- Current'. Day numbers are
-    never zero-padded (e.g. 'Sep 6', not 'Sep 06')."""
-
-    def month_day(d: date) -> str:
-        return f"{d.strftime('%b')} {d.day}"
-
-    sunday = monday + timedelta(days=6)
-    if monday.year != sunday.year:
-        label = f"{month_day(monday)}, {monday.year}–{month_day(sunday)}, {sunday.year}"
-    elif monday.month != sunday.month:
-        label = f"{month_day(monday)}–{month_day(sunday)}, {sunday.year}"
-    else:
-        label = f"{month_day(monday)}–{sunday.day}, {sunday.year}"
+    """The Period dropdown's display label: just the date of that period's
+    Wednesday (e.g. 'Sep 16, 2026'), not a Mon-Sun date range -- optionally
+    suffixed ' -- Current'. Day numbers are never zero-padded (e.g. 'Sep
+    6', not 'Sep 06'). The period's Monday stays the canonical identifier
+    everywhere else (storage, is_period_editable(), etc.) -- this only
+    changes how it's displayed in the dropdown."""
+    wednesday = monday + timedelta(days=2)
+    label = f"{wednesday.strftime('%b')} {wednesday.day}, {wednesday.year}"
     return f"{label} — Current" if is_current else label
 
 
