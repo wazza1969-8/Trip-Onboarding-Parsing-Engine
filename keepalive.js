@@ -20,10 +20,9 @@
  */
 const { chromium } = require("playwright");
 
-// Set this to your app's real Streamlit URL, e.g.
-// "https://itp-sales-hub.streamlit.app/" -- or pass it in via the
-// APP_URL repo variable/secret referenced in keepalive.yml.
-const APP_URL = process.env.APP_URL || "https://REPLACE-WITH-YOUR-APP.streamlit.app/";
+// Can still be overridden by the APP_URL repo variable referenced in
+// keepalive.yml, but defaults to the real ITP Sales Hub app URL directly.
+const APP_URL = process.env.APP_URL || "https://itpsales.streamlit.app/";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
