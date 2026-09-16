@@ -19,6 +19,27 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import parsing_engine as pe
 
+try:
+    # Optional until requirements.txt is installed with this package.
+    # Only actually used when TURSO_DATABASE_URL is configured (see
+    # get_conn() below) -- everything falls back to local SQLite
+    # otherwise, so this module still imports fine without it.
+    import turso_serverless
+except ImportError:  # pragma: no cover - exercised only if the package is missing
+    turso_serverless = None
+
+# IntegrityError under whichever backend get_conn() actually opened --
+# a plain sqlite3 connection (local file / tests) or a turso_serverless
+# connection (production, once TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are
+# set). Every `except sqlite3.IntegrityError:` in this file that guards
+# a UNIQUE-constraint violation needs to also catch the Turso one, so
+# it's caught here once and reused everywhere below.
+_INTEGRITY_ERRORS = (
+    (sqlite3.IntegrityError, turso_serverless.IntegrityError)
+    if turso_serverless is not None
+    else (sqlite3.IntegrityError,)
+)
+
 DB_PATH = Path(__file__).parent / "requests.db"
 
 STATUS_SUBMITTED = "Submitted"
@@ -51,8 +72,57 @@ WEEKLY_REPORT_CATEGORIES = [
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
-def get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+def _turso_credentials():
+    """(url, auth_token) from secrets/env, or (None, None) if not configured.
+
+    Uses the same _get_secret() fallback (st.secrets, then os.environ) as
+    every other credential in this file -- but note this is called with
+    secrets_getter=None, relying on Streamlit's documented behavior of
+    also exposing root-level secrets.toml keys as real environment
+    variables. That's what lets get_conn() (called from ~30 functions
+    that only take db_path, not secrets_getter) pick up
+    TURSO_DATABASE_URL/TURSO_AUTH_TOKEN without threading a
+    secrets_getter parameter through every one of those call sites.
+    """
+    url = _get_secret(None, "TURSO_DATABASE_URL")
+    token = _get_secret(None, "TURSO_AUTH_TOKEN")
+    return url, token
+
+
+def _set_row_factory(conn) -> None:
+    """sqlite3.Row for a local connection, turso_serverless.Row for a
+    Turso one -- both support row["col"] and row[0] the same way, so
+    every caller below can keep using that syntax regardless of which
+    backend is actually in use."""
+    if isinstance(conn, sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+    else:
+        conn.row_factory = turso_serverless.Row
+
+
+def get_conn(db_path: Path = DB_PATH):
+    """Opens a database connection -- a remote Turso database if
+    TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are configured (production:
+    persists across Streamlit Community Cloud's container
+    restarts/redeploys), otherwise a local SQLite file at `db_path`
+    (local dev and the test suite, unchanged from before this app used
+    Turso).
+
+    Every function below opens/closes its own connection via this same
+    helper -- that pattern is unchanged; only what get_conn() connects
+    to is new. See _turso_credentials() for how the choice is made.
+    """
+    turso_url, turso_token = _turso_credentials()
+    if turso_url:
+        if turso_serverless is None:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL is set, but the turso_serverless package "
+                "isn't installed. Add turso_serverless to requirements.txt "
+                "and redeploy."
+            )
+        conn = turso_serverless.connect(turso_url, auth_token=turso_token)
+    else:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS requests (
             id TEXT PRIMARY KEY,
@@ -144,7 +214,7 @@ def _migrate_legacy_period_format(conn: sqlite3.Connection) -> None:
                 "UPDATE weekly_reports SET period = ? WHERE period = ?",
                 (new_period, old_period),
             )
-        except sqlite3.IntegrityError:
+        except _INTEGRITY_ERRORS:
             # A row for (submitter, new_period) already exists for some
             # submitter -- extremely unlikely (the new format was never
             # writable before this migration existed), but fail safe by
@@ -187,7 +257,7 @@ def add_salesperson(name: str, db_path: Path = DB_PATH) -> None:
         try:
             conn.execute("INSERT INTO salespeople (name) VALUES (?)", (name,))
             conn.commit()
-        except sqlite3.IntegrityError:
+        except _INTEGRITY_ERRORS:
             raise ValueError(f"'{name}' is already in the list.")
     finally:
         conn.close()
@@ -204,7 +274,7 @@ def update_salesperson(old_name: str, new_name: str, db_path: Path = DB_PATH) ->
             if cur.rowcount == 0:
                 raise ValueError(f"'{old_name}' was not found (it may have just been changed elsewhere).")
             conn.commit()
-        except sqlite3.IntegrityError:
+        except _INTEGRITY_ERRORS:
             raise ValueError(f"'{new_name}' is already in the list.")
     finally:
         conn.close()
@@ -286,7 +356,7 @@ def add_report_team_member(name: str, db_path: Path = DB_PATH) -> None:
         try:
             conn.execute("INSERT INTO report_team_members (name) VALUES (?)", (name,))
             conn.commit()
-        except sqlite3.IntegrityError:
+        except _INTEGRITY_ERRORS:
             raise ValueError(f"'{name}' is already in the list.")
     finally:
         conn.close()
@@ -303,7 +373,7 @@ def update_report_team_member(old_name: str, new_name: str, db_path: Path = DB_P
             if cur.rowcount == 0:
                 raise ValueError(f"'{old_name}' was not found (it may have just been changed elsewhere).")
             conn.commit()
-        except sqlite3.IntegrityError:
+        except _INTEGRITY_ERRORS:
             raise ValueError(f"'{new_name}' is already in the list.")
     finally:
         conn.close()
@@ -612,7 +682,7 @@ def upsert_weekly_report(
 
 def get_weekly_report(submitter: str, period: str, db_path: Path = DB_PATH):
     conn = get_conn(db_path)
-    conn.row_factory = sqlite3.Row
+    _set_row_factory(conn)
     try:
         return conn.execute(
             "SELECT * FROM weekly_reports WHERE submitter = ? AND period = ?", (submitter, period)
@@ -623,7 +693,7 @@ def get_weekly_report(submitter: str, period: str, db_path: Path = DB_PATH):
 
 def list_weekly_reports_for_period(period: str, db_path: Path = DB_PATH) -> list[sqlite3.Row]:
     conn = get_conn(db_path)
-    conn.row_factory = sqlite3.Row
+    _set_row_factory(conn)
     try:
         return conn.execute(
             "SELECT * FROM weekly_reports WHERE period = ? ORDER BY submitter COLLATE NOCASE", (period,)
@@ -718,7 +788,7 @@ def add_recipient(email: str, db_path: Path = DB_PATH) -> None:
         try:
             conn.execute("INSERT INTO report_recipients (email) VALUES (?)", (email,))
             conn.commit()
-        except sqlite3.IntegrityError:
+        except _INTEGRITY_ERRORS:
             raise ValueError(f"'{email}' is already in the list.")
     finally:
         conn.close()
@@ -887,7 +957,7 @@ def update_result(request_id: str, result_bytes: bytes, result_filename: str, db
 
 def fetch_all_requests(db_path: Path = DB_PATH) -> list[sqlite3.Row]:
     conn = get_conn(db_path)
-    conn.row_factory = sqlite3.Row
+    _set_row_factory(conn)
     try:
         return conn.execute("SELECT * FROM requests ORDER BY created_at DESC").fetchall()
     finally:
@@ -896,7 +966,7 @@ def fetch_all_requests(db_path: Path = DB_PATH) -> list[sqlite3.Row]:
 
 def fetch_request(request_id: str, db_path: Path = DB_PATH):
     conn = get_conn(db_path)
-    conn.row_factory = sqlite3.Row
+    _set_row_factory(conn)
     try:
         return conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
     finally:
