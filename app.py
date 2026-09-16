@@ -811,13 +811,20 @@ elif task == "Weekly Report":
         if not team:
             st.warning("No team members configured yet. Add names above before submitting a report.")
         else:
-            submitter = st.selectbox("Your name", team, key="wr_submitter")
+            # No default selection -- starts blank every time so nobody can
+            # submit under someone else's name without realizing it. Only
+            # the person filling this in should ever pick their own name.
+            submitter = st.selectbox(
+                "Your name", team, index=None, placeholder="Select your name...", key="wr_submitter"
+            )
             is_current = selected_monday == wr_current_monday
             st.caption(
                 f"Reporting period: {backend.format_period_label(selected_monday, is_current=is_current)}"
             )
 
-            if period_editable:
+            if not submitter:
+                st.info("Select your name above to view or submit your report for this period.")
+            elif period_editable:
                 render_editable_report_form(submitter, selected_period_id, key_prefix="wr")
             else:
                 cutoff = backend.edit_cutoff(selected_monday)
