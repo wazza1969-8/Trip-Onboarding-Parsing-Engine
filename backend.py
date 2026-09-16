@@ -100,6 +100,20 @@ def _set_row_factory(conn) -> None:
         conn.row_factory = turso_serverless.Row
 
 
+# Every function in this file opens its own connection and closes it when
+# done -- cheap for a local SQLite file, but each statement over Turso is a
+# real network round trip. Re-running all 5 CREATE TABLE statements plus
+# the legacy-period migration check on every single call (as this file did
+# at first) meant ~6 extra round trips before any actual work happened --
+# noticeably slow in the UI. Since CREATE TABLE IF NOT EXISTS and the
+# migration are both idempotent, it's safe to run them only once per
+# target (this Turso database, or a given local file) per process, and
+# skip them on every call after that. Keyed by target (not a single
+# global flag) so tests against separate temp SQLite files each still get
+# their own one-time init.
+_schema_ready_targets: set[str] = set()
+
+
 def get_conn(db_path: Path = DB_PATH):
     """Opens a database connection -- a remote Turso database if
     TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are configured (production:
@@ -121,8 +135,20 @@ def get_conn(db_path: Path = DB_PATH):
                 "and redeploy."
             )
         conn = turso_serverless.connect(turso_url, auth_token=turso_token)
+        # Autocommit: skip the implicit BEGIN/COMMIT round trips this
+        # driver otherwise sends around every write (harmless here --
+        # every write function in this file does exactly one INSERT/UPDATE
+        # per connection, never several statements that need to commit
+        # together), cutting each write from 3 network round trips to 1.
+        conn.isolation_level = None
+        cache_key = turso_url
     else:
         conn = sqlite3.connect(db_path, check_same_thread=False)
+        cache_key = str(db_path)
+
+    if cache_key in _schema_ready_targets:
+        return conn
+
     conn.execute(
         """CREATE TABLE IF NOT EXISTS requests (
             id TEXT PRIMARY KEY,
@@ -175,6 +201,7 @@ def get_conn(db_path: Path = DB_PATH):
         )"""
     )
     _migrate_legacy_period_format(conn)
+    _schema_ready_targets.add(cache_key)
     return conn
 
 
