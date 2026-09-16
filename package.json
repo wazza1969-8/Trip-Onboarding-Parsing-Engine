@@ -1,0 +1,12 @@
+{
+  "name": "itp-sales-hub-keepalive",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Keeps the ITP Sales Hub Streamlit app awake and auto-wakes it when it falls asleep.",
+  "scripts": {
+    "keepalive": "node keepalive.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
