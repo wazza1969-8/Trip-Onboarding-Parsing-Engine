@@ -53,11 +53,23 @@ Deploying for a few users
     to survive indefinitely.
 """
 
+import os
 import uuid
 
 import streamlit as st
 
 import backend
+
+# True only when the process was launched by pytest -- which is how the
+# UI tests in test_weekly_report.py drive this file via AppTest. This
+# can NEVER be true in the deployed app (Streamlit Cloud doesn't run
+# pytest to serve it), so unlike a manually-set flag, there's no way for
+# this to end up accidentally left on in production. It exists solely
+# because Streamlit's AppTest harness has no supported way to simulate a
+# real logged-in OIDC identity, so the auth gate below has to be skipped
+# for that harness specifically -- everything else in the app is tested
+# exactly as it runs for a real user.
+_RUNNING_UNDER_TEST = "PYTEST_CURRENT_TEST" in os.environ
 
 # Icons shown next to each Weekly Report category -- purely cosmetic,
 # just for quick visual scanning; the underlying category keys/labels
@@ -370,6 +382,66 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ---------------------------------------------------------------------------
+# Authentication -- gates EVERYTHING below (including the task picker)
+# behind an Okta login, so nobody outside the company can view customer
+# PII or internal sales data just by visiting the URL.
+#
+# Fails CLOSED: if the [auth] secrets aren't fully configured, the app
+# refuses to show anything (rather than quietly falling back to open
+# access) until an administrator finishes setup. See DEPLOYMENT.md /
+# the IT request doc for exactly what needs to go in secrets.toml.
+#
+# Defense in depth: Okta's own app-assignment scope is the primary
+# control over who can even attempt to log in, but this also checks the
+# authenticated account's email domain independently, in case that
+# assignment is ever misconfigured.
+# ---------------------------------------------------------------------------
+ALLOWED_EMAIL_DOMAINS = ("jepp.com",)
+
+
+def _auth_is_configured() -> bool:
+    try:
+        auth = st.secrets.get("auth")
+    except Exception:
+        return False
+    if not auth:
+        return False
+    required = ("client_id", "client_secret", "server_metadata_url", "cookie_secret", "redirect_uri")
+    return all(auth.get(key) for key in required)
+
+
+if not _RUNNING_UNDER_TEST:
+    if not _auth_is_configured():
+        st.error(
+            "Login isn't configured for this app yet. An administrator needs to add "
+            "the `[auth]` block (client_id, client_secret, server_metadata_url, "
+            "cookie_secret, redirect_uri) under App settings -> Secrets before this "
+            "app can be used."
+        )
+        st.stop()
+
+    if not st.user.is_logged_in:
+        st.subheader("Sign in required")
+        st.caption(
+            "This app contains customer and internal sales data -- sign in with your "
+            "JFF account to continue."
+        )
+        st.button("Log in with Okta", on_click=st.login, type="primary")
+        st.stop()
+
+    _user_email = (st.user.get("email") or "").strip().lower()
+    if not any(_user_email.endswith(f"@{d}") for d in ALLOWED_EMAIL_DOMAINS):
+        st.error(f"Access denied -- {st.user.get('email') or 'this account'} is not authorized for this app.")
+        st.button("Log out", on_click=st.logout)
+        st.stop()
+
+    col_user, col_logout = st.columns([6, 1])
+    with col_user:
+        st.caption(f"Signed in as {st.user.get('name') or st.user.get('email')}")
+    with col_logout:
+        st.button("Log out", on_click=st.logout, key="top_logout_btn")
 
 if "task" not in st.session_state:
     st.session_state["task"] = None
@@ -857,17 +929,25 @@ elif task == "Weekly Report":
             for idx, name in enumerate(team):
                 row = rows_by_submitter.get(name)
                 with st.container(border=True):
+                    # Submitted/Updated columns widened (and Name/Status
+                    # trimmed) to make room for three stacked timezone
+                    # lines each, instead of the single business-timezone
+                    # line shown elsewhere in the app.
                     col_name, col_status, col_submitted, col_updated, col_action = st.columns(
-                        [0.26, 0.16, 0.19, 0.19, 0.20]
+                        [0.20, 0.13, 0.25, 0.25, 0.17]
                     )
                     with col_name:
                         st.markdown(f"**{name}**")
                     with col_status:
                         st.markdown("🟢 Submitted" if row else "⚪ Not submitted")
                     with col_submitted:
-                        st.caption(backend.format_timestamp(row["submitted_at"]) if row else "—")
+                        submitted_lines = backend.format_timestamp_multi_tz(row["submitted_at"]) if row else ["—"]
+                        for line in submitted_lines:
+                            st.caption(line)
                     with col_updated:
-                        st.caption(backend.format_timestamp(row["updated_at"]) if row else "—")
+                        updated_lines = backend.format_timestamp_multi_tz(row["updated_at"]) if row else ["—"]
+                        for line in updated_lines:
+                            st.caption(line)
                     with col_action:
                         if row and period_editable:
                             if st.button("Edit", key=f"wrview_edit_btn_{idx}"):

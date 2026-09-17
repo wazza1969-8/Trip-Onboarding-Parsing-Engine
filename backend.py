@@ -641,6 +641,44 @@ def format_timestamp(iso_utc: str | None, tz: ZoneInfo | None = None) -> str:
         return iso_utc
 
 
+# Real IANA zones (not fixed UTC offsets) so British Summer Time and the
+# US Eastern/Pacific DST transitions are all handled automatically and
+# correctly for the timestamp's own calendar date -- not just whichever
+# offset happens to be in effect today. Used by View All Reports to show
+# every submission/update time in all three zones at once.
+LONDON_TZ_NAME = "Europe/London"
+US_EASTERN_TZ_NAME = "America/New_York"
+US_PACIFIC_TZ_NAME = "America/Los_Angeles"
+
+
+def format_timestamp_multi_tz(iso_utc: str | None) -> list[str]:
+    """Formats a stored UTC ISO-8601 timestamp into three lines -- one
+    each for London, US Eastern, and US Pacific time, in that order.
+    Each is converted independently via its real IANA zone, so DST is
+    always correct for that specific timestamp (e.g. a submission made
+    during UK winter but viewed after the US "spring forward" still
+    shows the correct historical offset for each side). Returns three
+    em dashes for a missing value."""
+    if not iso_utc:
+        return ["—", "—", "—"]
+    try:
+        dt = datetime.fromisoformat(iso_utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return [iso_utc, iso_utc, iso_utc]
+
+    def line(zone_name: str, label: str) -> str:
+        local = dt.astimezone(ZoneInfo(zone_name))
+        return f"{label}: {local.strftime('%b %d, %Y %I:%M %p')}"
+
+    return [
+        line(LONDON_TZ_NAME, "London"),
+        line(US_EASTERN_TZ_NAME, "US Eastern"),
+        line(US_PACIFIC_TZ_NAME, "US Pacific"),
+    ]
+
+
 def upsert_weekly_report(
     submitter: str,
     period: str,
