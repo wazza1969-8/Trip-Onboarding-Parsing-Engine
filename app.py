@@ -53,6 +53,7 @@ Deploying for a few users
     to survive indefinitely.
 """
 
+import hmac
 import os
 import uuid
 
@@ -412,36 +413,84 @@ def _auth_is_configured() -> bool:
     return all(auth.get(key) for key in required)
 
 
+def _interim_password() -> str | None:
+    """The temporary shared-password stopgap -- used only until the real
+    Okta `[auth]` secrets above are configured, at which point Okta takes
+    over automatically and this is never consulted again. Weaker than
+    Okta on purpose-for-now: one shared secret, no per-person identity,
+    no revocation -- just enough to keep the public out while IT
+    provisions the real SSO app."""
+    try:
+        pw = st.secrets.get("APP_PASSWORD")
+    except Exception:
+        return None
+    return pw or None
+
+
 if not _RUNNING_UNDER_TEST:
-    if not _auth_is_configured():
-        st.error(
-            "Login isn't configured for this app yet. An administrator needs to add "
-            "the `[auth]` block (client_id, client_secret, server_metadata_url, "
-            "cookie_secret, redirect_uri) under App settings -> Secrets before this "
-            "app can be used."
-        )
-        st.stop()
+    if _auth_is_configured():
+        # -- Real path: Okta SSO via Streamlit's native OIDC login. -----------
+        if not st.user.is_logged_in:
+            st.subheader("Sign in required")
+            st.caption(
+                "This app contains customer and internal sales data -- sign in with your "
+                "JFF account to continue."
+            )
+            st.button("Log in with Okta", on_click=st.login, type="primary")
+            st.stop()
 
-    if not st.user.is_logged_in:
-        st.subheader("Sign in required")
-        st.caption(
-            "This app contains customer and internal sales data -- sign in with your "
-            "JFF account to continue."
-        )
-        st.button("Log in with Okta", on_click=st.login, type="primary")
-        st.stop()
+        _user_email = (st.user.get("email") or "").strip().lower()
+        if not any(_user_email.endswith(f"@{d}") for d in ALLOWED_EMAIL_DOMAINS):
+            st.error(f"Access denied -- {st.user.get('email') or 'this account'} is not authorized for this app.")
+            st.button("Log out", on_click=st.logout)
+            st.stop()
 
-    _user_email = (st.user.get("email") or "").strip().lower()
-    if not any(_user_email.endswith(f"@{d}") for d in ALLOWED_EMAIL_DOMAINS):
-        st.error(f"Access denied -- {st.user.get('email') or 'this account'} is not authorized for this app.")
-        st.button("Log out", on_click=st.logout)
-        st.stop()
+        col_user, col_logout = st.columns([6, 1])
+        with col_user:
+            st.caption(f"Signed in as {st.user.get('name') or st.user.get('email')}")
+        with col_logout:
+            st.button("Log out", on_click=st.logout, key="top_logout_btn")
 
-    col_user, col_logout = st.columns([6, 1])
-    with col_user:
-        st.caption(f"Signed in as {st.user.get('name') or st.user.get('email')}")
-    with col_logout:
-        st.button("Log out", on_click=st.logout, key="top_logout_btn")
+    else:
+        _stopgap_password = _interim_password()
+        if not _stopgap_password:
+            st.error(
+                "Login isn't configured for this app yet. An administrator needs to add "
+                "the `[auth]` block (client_id, client_secret, server_metadata_url, "
+                "cookie_secret, redirect_uri) under App settings -> Secrets before this "
+                "app can be used."
+            )
+            st.stop()
+
+        # -- Temporary stopgap: a single shared password, used only while
+        # Okta is being provisioned. Automatically stops being consulted
+        # the moment a valid `[auth]` block is added above -- no code
+        # change needed to retire it.
+        if not st.session_state.get("interim_auth_ok"):
+            st.subheader("Sign in required")
+            st.warning(
+                "Okta SSO isn't set up for this app yet, so it's temporarily behind a "
+                "shared password instead. This is a stopgap only -- everyone uses the "
+                "same password, there's no per-person identity or audit trail, and it "
+                "will be replaced by Okta login automatically once that's configured. "
+                "Ask your team lead if you don't have the password."
+            )
+            _attempts = st.session_state.get("interim_auth_attempts", 0)
+            if _attempts >= 5:
+                st.error("Too many incorrect attempts this session. Refresh the page to try again.")
+                st.stop()
+            _entered = st.text_input("Password", type="password", key="interim_auth_input")
+            if st.button("Enter", type="primary"):
+                if hmac.compare_digest(_entered, _stopgap_password):
+                    st.session_state["interim_auth_ok"] = True
+                    st.session_state["interim_auth_attempts"] = 0
+                    st.rerun()
+                else:
+                    st.session_state["interim_auth_attempts"] = _attempts + 1
+                    st.error("Incorrect password.")
+            st.stop()
+
+        st.caption("Temporary shared-password access (Okta SSO not yet configured)")
 
 if "task" not in st.session_state:
     st.session_state["task"] = None
