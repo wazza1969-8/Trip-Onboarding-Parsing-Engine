@@ -65,27 +65,32 @@ class PeriodMathTests(unittest.TestCase):
         self.assertEqual(backend.monday_from_period_id("2026-W36"), date(2026, 8, 31))
 
     def test_format_period_label_same_month(self):
-        self.assertEqual(backend.format_period_label(date(2026, 8, 17)), "Aug 17–23, 2026")
+        # Label is now just that period's Wednesday date, not a Mon-Sun
+        # range -- Aug 17, 2026 (Mon) + 2 days = Aug 19.
+        self.assertEqual(backend.format_period_label(date(2026, 8, 17)), "Aug 19, 2026")
 
     def test_format_period_label_month_boundary(self):
-        self.assertEqual(backend.format_period_label(date(2026, 8, 31)), "Aug 31–Sep 6, 2026")
+        # Aug 31, 2026 (Mon) + 2 days = Sep 2.
+        self.assertEqual(backend.format_period_label(date(2026, 8, 31)), "Sep 2, 2026")
 
     def test_format_period_label_current_suffix(self):
         self.assertEqual(
             backend.format_period_label(date(2026, 8, 31), is_current=True),
-            "Aug 31–Sep 6, 2026 — Current",
+            "Sep 2, 2026 — Current",
         )
 
     def test_format_period_label_no_leading_zero_on_day(self):
         label = backend.format_period_label(date(2026, 9, 7))
-        self.assertNotIn("07", label)
-        self.assertIn("Sep 7", label)
+        self.assertNotIn("09", label)
+        self.assertIn("Sep 9", label)
 
     def test_year_end_transition_label(self):
-        # Dec 28, 2026 is a Monday; its Sunday (Jan 3, 2027) is next year.
+        # Dec 28, 2026 is a Monday; its Wednesday (Dec 30, 2026) is still
+        # the same year, so this no longer crosses a year boundary now
+        # that the label is a single Wednesday date rather than a range.
         self.assertEqual(date(2026, 12, 28).weekday(), 0)
         label = backend.format_period_label(date(2026, 12, 28))
-        self.assertEqual(label, "Dec 28, 2026–Jan 3, 2027")
+        self.assertEqual(label, "Dec 30, 2026")
 
     def test_year_end_transition_available_periods(self):
         periods = backend.available_periods(TZ, dt(2026, 12, 28))
@@ -96,7 +101,48 @@ class PeriodMathTests(unittest.TestCase):
     def test_month_end_transition_available_periods(self):
         periods = backend.available_periods(TZ, dt(2026, 8, 31))
         self.assertIn(date(2026, 8, 31), periods)
-        self.assertEqual(backend.format_period_label(date(2026, 8, 31)), "Aug 31–Sep 6, 2026")
+        self.assertEqual(backend.format_period_label(date(2026, 8, 31)), "Sep 2, 2026")
+
+    def test_period_label_is_the_wednesday_date_not_a_range(self):
+        """The compiled report header and email subject must show the same
+        single date the Period dropdown shows -- not a Mon-Sun range."""
+        label = backend.period_label("2026-09-21")
+        self.assertEqual(label, "Sep 23, 2026")
+        self.assertNotIn("Week of", label)
+        self.assertNotIn("-", label)
+
+    def test_period_label_matches_the_dropdown_label_exactly(self):
+        """These two are shown side by side -- the dropdown says which
+        period is being compiled, the report header says which period was
+        compiled. If they ever disagree, one of them is lying."""
+        for monday in (date(2026, 8, 31), date(2026, 9, 21), date(2026, 12, 28)):
+            period = backend.period_id_from_monday(monday)
+            self.assertEqual(
+                backend.period_label(period),
+                backend.format_period_label(monday),
+                f"header and dropdown disagree for {monday}")
+
+    def test_period_label_crosses_month_boundary_on_the_wednesday(self):
+        # Mon 31 Aug 2026 -> Wed 2 Sep 2026: the label follows the
+        # Wednesday into the new month.
+        self.assertEqual(backend.period_label("2026-08-31"), "Sep 2, 2026")
+
+    def test_period_label_accepts_legacy_iso_week_identifier(self):
+        legacy = backend.period_label("2026-W39")
+        self.assertEqual(legacy, backend.period_label("2026-09-21"))
+
+    def test_period_label_returns_unparseable_input_unchanged(self):
+        self.assertEqual(backend.period_label("not-a-period"), "not-a-period")
+
+    def test_compiled_report_header_shows_the_wednesday_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "t.db")
+            backend.upsert_weekly_report(
+                "Aaron Aardvark", "2026-09-21", {"highlights": "Something happened"},
+                db_path=db, now=dt(2026, 9, 23, 10, 0))
+            text = backend.compile_weekly_report_text("2026-09-21", db_path=db)
+        self.assertIn("WEEKLY TEAM REPORT -- Sep 23, 2026", text)
+        self.assertNotIn("Week of", text)
 
     def test_dst_transition_cutoff_stays_local_2359(self):
         # Find an actual DST transition in America/Denver by scanning
@@ -332,6 +378,43 @@ class MigrationTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# format_timestamp_multi_tz: London / US Eastern / US Pacific, each via its
+# real IANA zone so DST is handled correctly for the timestamp's own date,
+# not just whatever offset happens to be in effect when the test runs.
+# ---------------------------------------------------------------------------
+class MultiTimezoneDisplayTests(unittest.TestCase):
+    def test_missing_value_returns_three_em_dashes(self):
+        self.assertEqual(backend.format_timestamp_multi_tz(None), ["—", "—", "—"])
+
+    def test_malformed_value_falls_back_to_raw_string(self):
+        self.assertEqual(backend.format_timestamp_multi_tz("not-a-date"), ["not-a-date"] * 3)
+
+    def test_summer_instant_uses_bst_edt_pdt(self):
+        # 2026-07-15 18:00 UTC -- UK on BST (+1), US East on EDT (-4), US West on PDT (-7).
+        lines = backend.format_timestamp_multi_tz("2026-07-15T18:00:00+00:00")
+        self.assertEqual(lines, [
+            "London: Jul 15, 2026 07:00 PM",
+            "US Eastern: Jul 15, 2026 02:00 PM",
+            "US Pacific: Jul 15, 2026 11:00 AM",
+        ])
+
+    def test_winter_instant_uses_gmt_est_pst(self):
+        # 2026-01-15 18:00 UTC -- UK on GMT (+0), US East on EST (-5), US West on PST (-8).
+        lines = backend.format_timestamp_multi_tz("2026-01-15T18:00:00+00:00")
+        self.assertEqual(lines, [
+            "London: Jan 15, 2026 06:00 PM",
+            "US Eastern: Jan 15, 2026 01:00 PM",
+            "US Pacific: Jan 15, 2026 10:00 AM",
+        ])
+
+    def test_naive_iso_string_assumed_utc(self):
+        # No offset in the string (matches _now()'s own output format
+        # for legacy rows) -- must still be treated as UTC, not local.
+        lines = backend.format_timestamp_multi_tz("2026-07-15T18:00:00")
+        self.assertEqual(lines[0], "London: Jul 15, 2026 07:00 PM")
+
+
+# ---------------------------------------------------------------------------
 # UI: default period selection, session persistence, empty state.
 # Requires streamlit's AppTest harness.
 # ---------------------------------------------------------------------------
@@ -405,11 +488,51 @@ class UITests(unittest.TestCase):
         self.assertFalse(at.exception)
         return at
 
+    def test_submitter_selectbox_starts_blank_not_defaulted(self):
+        # Regression test: "Your name" must never silently default to
+        # whichever team member happens to sort first -- that let people
+        # submit a report under someone else's name without noticing.
+        # It must start unselected, and the form must not appear (nor
+        # should any name be assumed) until the person actively picks
+        # their own name.
+        at = self._open_weekly_report()
+        at = self._add_team_member(at, "Aaron Aardvark")  # deliberately sorts first
+        self.assertFalse(at.exception)
+
+        submitter_box = at.selectbox(key="wr_submitter")
+        self.assertIsNone(submitter_box.value)
+
+        info_texts = " ".join(i.value for i in at.info)
+        self.assertIn("Select your name above", info_texts)
+        # The bullet-entry form (an "Add entry" button in the shared
+        # render_editable_report_form) must not be showing yet either.
+        self.assertFalse(any("add entry" in b.label.lower() for b in at.button))
+
+        # Once a name is actually picked, the form appears as normal.
+        at.selectbox(key="wr_submitter").set_value("Aaron Aardvark").run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(at.selectbox(key="wr_submitter").value, "Aaron Aardvark")
+
     def test_empty_period_shows_helpful_message_in_view_all_reports(self):
         at = self._open_weekly_report()
         at = self._add_team_member(at, "Test Person")
         info_texts = " ".join(i.value for i in at.info)
         self.assertIn("No reports have been submitted yet for this period.", info_texts)
+
+    def test_view_all_reports_shows_all_three_timezones(self):
+        at = self._open_weekly_report()
+        at = self._add_team_member(at, "Tz Person")
+        at.selectbox(key="wr_submitter").set_value("Tz Person").run(timeout=30)
+        backend.upsert_weekly_report(
+            "Tz Person", backend.current_period(), {"highlights": "hello"}
+        )
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+
+        caption_texts = [c.value for c in at.caption]
+        self.assertTrue(any(t.startswith("London: ") for t in caption_texts))
+        self.assertTrue(any(t.startswith("US Eastern: ") for t in caption_texts))
+        self.assertTrue(any(t.startswith("US Pacific: ") for t in caption_texts))
 
     def test_locked_report_is_viewable_not_editable(self):
         at = self._open_weekly_report()

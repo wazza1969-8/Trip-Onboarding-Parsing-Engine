@@ -455,10 +455,11 @@ def import_report_team_members_json(json_text: str, db_path: Path = DB_PATH) -> 
 # A reporting period is always Monday-Sunday. Its Monday (a `date`) is
 # the single canonical identifier for a period everywhere in this
 # module and in app.py -- see period_id_from_monday() /
-# monday_from_period_id(). Formatted strings like "Aug 31-Sep 6, 2026"
-# (format_period_label) or "Week of Aug 24-Aug 30, 2026" (period_label,
-# kept for the existing compiled-report header/email subject) are for
-# display only and are never stored or compared.
+# monday_from_period_id(). Formatted strings are for display only and
+# are never stored or compared: format_period_label() renders a period
+# as its Wednesday date ("Sep 23, 2026") for the Period dropdown, and
+# period_label() renders the same date for the compiled-report header
+# and email subject, so the two always agree.
 #
 # "Current period", "now", and every edit-cutoff check below are all
 # computed from server time in BUSINESS_TIMEZONE (see
@@ -606,20 +607,24 @@ def current_period(on_date: date | None = None) -> str:
 
 
 def period_label(period: str) -> str:
-    """Turns a period identifier into 'Week of Aug 24-Aug 30, 2026' --
-    used in the compiled report header and email subject line. Accepts
-    both the canonical Monday-date identifier and the legacy ISO-week
-    identifier (via monday_from_period_id()). For the Period dropdown's
-    own label format ('Aug 17-23, 2026'), use format_period_label()
-    instead."""
+    """Turns a period identifier into that period's Wednesday date
+    ('Sep 23, 2026') -- used in the compiled report header and the email
+    subject line.
+
+    Deliberately identical to what the Period dropdown shows via
+    format_period_label(), so a compiled report is labelled with the same
+    date the person picked to compile it. It used to render a Mon-Sun
+    range ('Week of Sep 21-27, 2026'), which no longer matched the
+    dropdown once that moved to the Wednesday date.
+
+    Accepts both the canonical Monday-date identifier and the legacy
+    ISO-week identifier (via monday_from_period_id()), and returns the
+    input unchanged if it is neither."""
     try:
         monday = monday_from_period_id(period)
     except (ValueError, IndexError):
         return period
-    sunday = monday + timedelta(days=6)
-    if monday.month == sunday.month:
-        return f"Week of {monday.strftime('%b %d')}-{sunday.strftime('%d, %Y')}"
-    return f"Week of {monday.strftime('%b %d')} - {sunday.strftime('%b %d, %Y')}"
+    return format_period_label(monday)
 
 
 def format_timestamp(iso_utc: str | None, tz: ZoneInfo | None = None) -> str:
@@ -1085,13 +1090,21 @@ def get_anthropic_client(secrets_getter=None):
     )
 
 
-def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secrets_getter=None, db_path: Path = DB_PATH, salesperson: str | None = None) -> None:
+def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secrets_getter=None, db_path: Path = DB_PATH, salesperson: str | None = None, sections_sink=None) -> None:
     """Runs the onboarding PDF through parsing_engine.py's pipeline and
     stores the resulting .xlsx (or the error) back on the request row.
     progress_callback(fraction: float, text: str), if given, is called
     after each page is read. `salesperson` is the name selected in the
     intake form's Salesperson dropdown -- passed through to General
-    Info's "Jeppesen FF Account Exec" line instead of a placeholder."""
+    Info's "Jeppesen FF Account Exec" line instead of a placeholder.
+
+    sections_sink(sections: list[dict]), if given, is handed the raw
+    extraction -- the same list that feeds map_to_subjects() -- before
+    the workbook is written. The entry-ready view needs field-level
+    label/value pairs, which the .xlsx (21 rows of composed prose) can no
+    longer provide once written. This is a pass-through only: nothing
+    here stores the raw extraction, and the caller decides its lifetime.
+    See the approval request in the delivery notes about persisting it."""
     try:
         client, model = get_anthropic_client(secrets_getter)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1108,6 +1121,16 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
                 for section in result.get("sections", []):
                     section["page"] = i
                     sections.append(section)
+
+            if sections_sink is not None:
+                # Handed over before mapping so the sink sees exactly what
+                # the engine saw, un-formatted. Failures here must never
+                # cost the user their parse, so they are swallowed -- the
+                # workbook is the deliverable, the entry-ready view is not.
+                try:
+                    sections_sink(sections)
+                except Exception:
+                    pass
 
             by_subject = pe.map_to_subjects(sections, salesperson=salesperson)
             pe.write_workbook(by_subject, out_path)
