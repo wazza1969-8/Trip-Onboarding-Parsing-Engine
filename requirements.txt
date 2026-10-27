@@ -4,3 +4,4 @@ pymupdf
 openpyxl
 pillow
 turso_serverless
+Authlib
