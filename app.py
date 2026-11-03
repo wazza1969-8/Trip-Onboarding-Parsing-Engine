@@ -360,10 +360,28 @@ st.markdown(
         border: 1px solid rgba(255,255,255,0.15);
         border-radius: 10px;
     }}
-    input, textarea, [data-baseweb="select"] > div {{
+        input, textarea, [data-baseweb="select"] > div {{
         background-color: rgba(255,255,255,0.92) !important;
-        color: #0b1c26 !important;
         border-radius: 6px !important;
+    }}
+    /* Dark text on the light input backgrounds above. Applied to
+       DESCENDANTS, not just the direct child, because the broad
+       `div {{ color: #eaf3f6 }}` rule earlier in this stylesheet paints
+       every div near-white -- and a select's chosen value sits in a div
+       nested several levels inside the component, so it rendered white
+       on white. How deeply Streamlit nests that value changes between
+       versions, so this must not depend on it. The popover/listbox
+       selectors cover the open dropdown, which renders outside the
+       select element entirely. */
+    input, textarea,
+    [data-baseweb="select"] > div,
+    [data-baseweb="select"] > div div,
+    [data-baseweb="select"] > div span,
+    [data-baseweb="popover"] div,
+    [data-baseweb="popover"] span,
+    [role="listbox"] div,
+    [role="option"] {{
+        color: #0b1c26 !important;
     }}
     [data-testid="stFileUploaderDropzone"] {{
         background: rgba(255,255,255,0.07) !important;
