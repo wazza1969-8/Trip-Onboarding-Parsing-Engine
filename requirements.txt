@@ -1,7 +1,1 @@
-streamlit
-anthropic[bedrock]
-pymupdf
-openpyxl
-pillow
-turso_serverless
-Authlib
+
