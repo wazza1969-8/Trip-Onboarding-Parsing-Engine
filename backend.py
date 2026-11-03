@@ -1132,7 +1132,20 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
                 except Exception:
                     pass
 
-            by_subject = pe.map_to_subjects(sections, salesperson=salesperson)
+            # Both of these come from the intake form, not the PDF. The
+            # account number is read back off the stored request rather
+            # than passed in, so a retry picks up the same value without
+            # the caller having to remember it. The date is taken in the
+            # business timezone -- this container runs UTC, so a late
+            # run on the 31st would otherwise be stamped next month.
+            request_row = fetch_request(request_id, db_path)
+            acct_nbr = request_row["jeppesen_acct_nbr"] if request_row is not None else None
+            as_of = datetime.now(get_business_timezone()).date()
+
+            by_subject = pe.map_to_subjects(
+                sections, salesperson=salesperson,
+                jeppesen_acct_nbr=acct_nbr, as_of=as_of,
+            )
             pe.write_workbook(by_subject, out_path)
             result_bytes = out_path.read_bytes()
 

@@ -77,12 +77,19 @@ import base64
 import json
 import re
 import sys
+from datetime import date
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # 1. Fixed output subjects -- must match the Operational Information grid
 # ---------------------------------------------------------------------------
 SUBJECTS = [
+    # Listed first on purpose -- it identifies the account every other row
+    # belongs to. Unlike the rest, it is not extracted from the source PDF:
+    # it comes from the Jeppesen Acct Nbr typed into the intake form, and is
+    # threaded through map_to_subjects()/add_static_content() as
+    # `jeppesen_acct_nbr`.
+    "Jeppesen Account Number",
     "Company Details",
     "Communications",
     "High Profile Notes",
@@ -104,6 +111,13 @@ SUBJECTS = [
     "FP - Preferred Routing",
     "FP - Weather Packages",
     "FP - Remarks",
+    # The three trailing sections, in this fixed order. All are fed from
+    # the source PDF like the rest -- they sit at the end because that is
+    # where the business wants them on the sheet, not because they are
+    # special.
+    "Aircraft Decal",
+    "General Comments",
+    "ForeFlight Mobile (FFM) Services tab",
 ]
 
 # ---------------------------------------------------------------------------
@@ -125,7 +139,11 @@ SECTION_MAP = {
     "customs": "Customs Information",
     "catering": "Catering",
     "ground transport": "Ground Transport",
-    "general comments": "FP - Remarks",
+    # General Comments has its own output subject. It used to feed
+    # "FP - Remarks"; that subject is left in the sheet but now receives
+    # nothing, alongside the other FP- subjects this form does not cover.
+    "general comments": "General Comments",
+    "customer tools": "ForeFlight Mobile (FFM) Services tab",
 }
 
 # ---------------------------------------------------------------------------
@@ -175,6 +193,10 @@ FIELD_WHITELIST = {
         "USA TSA Waiver held", "USA CBP Border Overflight Exemption held",
         "Visa Waiver Program Signatory Carrier", "Third Country Operator (TCO)",
         "APIS Carrier code",
+        # Q4's decal table. One item per filled row -- the Customs heading
+        # feeds both "Customs Information" and "Aircraft Decal" (see
+        # MULTI_SUBJECT_FORMATTERS), and only this field reaches the latter.
+        "Annual USA Customs Decals held",
     ],
     # Only these two feed the derived towbar lines -- see
     # format_ground_handling_section(). Split into two fields (rather than
@@ -212,8 +234,18 @@ FIELD_WHITELIST = {
         "Mode of transport for passengers", "Preferred car rental companies",
         "Preferred car type",
     ],
+    # Both free-text questions in the General Comments Section.
     "general comments": [
-        "Challenges with other Trip Support Providers",
+        "Challenges with other Trip Support Providers",      # Q1
+        "Other relevant operational preferences",            # Q2
+    ],
+    # FFM Services tab page. Q1 is an opt-out checkbox whose state must
+    # always be reported (see SPECIAL_FIELD_INSTRUCTIONS); Q3 emits one
+    # item per filled personnel row.
+    "customer tools": [
+        "FFM Services tab opt-out checkbox",   # Q1
+        "ForeFlight account username",         # Q2
+        "Web Portal / FFM Services tab login", # Q3 -- one item per row
     ],
 }
 
@@ -230,6 +262,10 @@ NOT_COVERED_BY_THIS_DOC_TYPE = {
     "FP - Alternate Airports",
     "FP - Preferred Routing",
     "FP - Weather Packages",
+    # Used to receive the General Comments answers; those now have their
+    # own "General Comments" subject, so this one is left in the sheet but
+    # always blank, like the rest of the FP- family.
+    "FP - Remarks",
 }
 
 # ---------------------------------------------------------------------------
@@ -238,16 +274,36 @@ NOT_COVERED_BY_THIS_DOC_TYPE = {
 #    Edit the text here (not in map_to_subjects) to change what gets added.
 # ---------------------------------------------------------------------------
 
-# Always inserted into "High Profile Notes", verbatim, on every run.
-# Placeholders (XXX / XXXXX / 2026) are intentional -- fill in per customer
-# after the sheet is generated.
+# Always inserted into "High Profile Notes" on every run. The month and
+# year on the first line are filled in automatically from the date the
+# parse runs (e.g. "NOV 2026"); the 'XXXXX' FFD account placeholder is
+# still intentional and filled in by hand per customer.
+ONBOARDING_TEAM_NAMES = ["Jodi", "Michal", "Scott", "Ruby", "Bipin", "Robert", "Jason", "AJ"]
+
 HIGH_PROFILE_NOTES_TEMPLATE = """\
-** NEW CUSTOMER - XXX 2026 *****ONBOARDING TEAM ACCOUNT (Jodi, Michal, Scott, Ruby, Bipin, Robert)
+** NEW CUSTOMER - {month} {year} *****ONBOARDING TEAM ACCOUNT ({team})
 
 Credit Card Customer - Advance deposit required.
 (If CC customer, click “Visa” under Payment Methods and leave card # blank). This will trigger the planners to get a CC deposit.
 
 FFD acct under 'XXXXX' (linked)"""
+
+
+def high_profile_notes(as_of: date | None = None) -> str:
+    """The High Profile Notes block, with the month/year of the run filled
+    in (e.g. "** NEW CUSTOMER - NOV 2026 *****...").
+
+    `as_of` is passed in by the app so the date comes from the business
+    timezone rather than from whatever the server's clock happens to be
+    -- on Streamlit Cloud (UTC) a parse run late on the 31st would
+    otherwise be stamped with the following month. Falls back to the
+    local date when run standalone from the CLI."""
+    today = as_of or date.today()
+    return HIGH_PROFILE_NOTES_TEMPLATE.format(
+        month=today.strftime("%b").upper(),
+        year=today.year,
+        team=", ".join(ONBOARDING_TEAM_NAMES),
+    )
 
 # Always appended to "General Info" on every run. The Account Exec name
 # comes from the Salesperson selected in the intake UI (passed through
@@ -260,6 +316,19 @@ GENERAL_INFO_ACCOUNT_EXEC_PLACEHOLDER = ">> Add Name <<"
 def _general_info_static_lines(salesperson: str | None = None) -> list[str]:
     name = (salesperson or "").strip() or GENERAL_INFO_ACCOUNT_EXEC_PLACEHOLDER
     return [f"Jeppesen FF Account Exec: {name}"]
+
+
+# Shown in the "Jeppesen Account Number" row when the intake form's
+# Jeppesen Acct Nbr field was left blank. A visible fill-in marker rather
+# than an empty cell, so an outstanding account number is obvious on the
+# sheet instead of looking like a section that simply has no content.
+JEPPESEN_ACCT_NBR_PLACEHOLDER = ">> Add Account Number <<"
+
+
+def _jeppesen_account_number_line(jeppesen_acct_nbr: str | None = None) -> str:
+    """Just the number -- the Subject column already names the field, so a
+    'Jeppesen Account Number:' prefix would only repeat it."""
+    return (jeppesen_acct_nbr or "").strip() or JEPPESEN_ACCT_NBR_PLACEHOLDER
 
 # The fixed option set for Aircraft Details Q2 ("What types of flight do
 # you operate?"). Always rendered in full with the customer's selection(s)
@@ -302,6 +371,38 @@ SPECIAL_FIELD_INSTRUCTIONS = {
         'and "Mobile" columns. Format each row\'s value as "<Name>, <Role>, <Email>'
         '[, Office: <Tel>][, Mobile: <Mobile>]", omitting either label if that '
         'column is blank. Emit one item per filled-in contact row.'
+    ),
+    "Annual USA Customs Decals held": (
+        'This is the "Do you hold any annual U.S.A. Customs Decals?" question '
+        'and its table of "Decal Number" / "Aircraft Tail" rows. There are TWO '
+        'such tables printed side by side on the page -- read both, left then '
+        'right. Emit ONE item per filled-in row, with the value formatted as '
+        '"<Decal Number>|<Aircraft Tail>" using a pipe between the two columns. '
+        'Strip spaces out of the decal number (write "26000755", not '
+        '"26 000 755"). Emit no items at all if every row is blank, regardless '
+        'of how the Yes/No box is marked.'
+    ),
+    "FFM Services tab opt-out checkbox": (
+        'On the "ForeFlight Mobile (FFM) Services tab" page, question 1 ends '
+        '"If you prefer to opt out, please check this box." with a single '
+        'checkbox. It is normal for it to be unchecked. ALWAYS report this '
+        'field: the value must be exactly "Checked" if the box is filled or '
+        'ticked, or "Unchecked" if it is empty. Do not omit it when unchecked.'
+    ),
+    "Web Portal / FFM Services tab login": (
+        'Question 3\'s personnel table, with columns "Name (First, Last)", '
+        '"Email address", "Is a ForeFlight Mobile user?", "Show PII Data?" and '
+        '"Services tab \'All Trips\' access?". The last three are each a single '
+        'Yes checkbox -- ticked means yes, empty means no. Emit ONE item per row '
+        'that has a name or an email, formatted as "<Name>, <Email>, Mobile '
+        'user: <Yes|No>, Show PII: <Yes|No>, All Trips access: <Yes|No>". Skip '
+        'entirely blank rows.'
+    ),
+    "Other relevant operational preferences": (
+        'This is question 2 of the General Comments Section ("Please provide us '
+        'with any other relevant information about your operational preferences '
+        'below..."). Report the free-text box contents verbatim. Omit the field '
+        'if the box is empty.'
     ),
 }
 
@@ -628,6 +729,12 @@ MULTI_SUBJECT_FORMATTERS = {
         ("Company Details", format_company_details_section),
         ("Communications", format_communications_section),
     ],
+    # The Customs page carries both the regulatory Yes/No questions and
+    # the annual decals table, which belong in different output subjects.
+    "customs": [
+        ("Customs Information", lambda items: format_customs_section(items)),
+        ("Aircraft Decal", lambda items: format_aircraft_decal_section(items)),
+    ],
 }
 
 
@@ -784,24 +891,36 @@ CUSTOMS_ARRANGE_FIELDS = {
     "UK General Avtn Report (GAR)",
 }
 
+# The 10 fields the "Customs Information" subject renders, in this exact
+# output order. Kept separate from FIELD_WHITELIST["customs"] because that
+# list also carries the annual-decals field, which belongs to the
+# "Aircraft Decal" subject instead -- the Customs page feeds both.
+CUSTOMS_INFORMATION_FIELDS = [
+    "USA Customs Notification", "eAPIS (USA)", "eAPIS (other countries)",
+    "UK Air Passenger Duty (APD)", "UK General Avtn Report (GAR)",
+    "USA TSA Waiver held", "USA CBP Border Overflight Exemption held",
+    "Visa Waiver Program Signatory Carrier", "Third Country Operator (TCO)",
+    "APIS Carrier code",
+]
+
 
 def format_customs_section(kept_items: list[tuple[str, str]]) -> list[str]:
-    """Render the customs fields in the fixed order given in
-    FIELD_WHITELIST['customs'] (not extraction order), one per line, with
+    """Render the customs fields in the fixed order given by
+    CUSTOMS_INFORMATION_FIELDS (not extraction order), one per line, with
     no [Customs] heading wrapper. Any field not answered on the page
     defaults to "N/A" rather than being omitted. For CUSTOMS_ARRANGE_FIELDS,
     the raw Yes/No is translated to who arranges the service."""
     values: dict[str, str] = {}
     for label, value in kept_items:
         norm_label = _normalize(label)
-        for canonical in FIELD_WHITELIST["customs"]:
+        for canonical in CUSTOMS_INFORMATION_FIELDS:
             norm_canonical = _normalize(canonical)
             if norm_label == norm_canonical or norm_canonical in norm_label or norm_label in norm_canonical:
                 values[canonical] = value
                 break
 
     lines = []
-    for canonical in FIELD_WHITELIST["customs"]:
+    for canonical in CUSTOMS_INFORMATION_FIELDS:
         value = values.get(canonical, "N/A")
         if canonical in CUSTOMS_ARRANGE_FIELDS:
             v = value.strip().lower()
@@ -848,11 +967,102 @@ def format_flight_monitoring_section(kept_items: list[tuple[str, str]]) -> list[
 # that takes the whitelisted (label, value) items for that heading and
 # returns the final list of output lines, bypassing the generic
 # "[Heading]\nlabel: value" rendering entirely.
+FFM_OPT_OUT_NOTICE = "USER HAS OPTED OUT OF HAVING FFD CONNECTED TO FSP"
+FFM_USERNAME_NOT_PROVIDED = "Not provided"
+
+
+def format_aircraft_decal_section(kept_items: list[tuple[str, str]]) -> list[str]:
+    """One line per decal row, tail first:  "N628GL - Decal 26000755".
+
+    The extraction step emits each row as "<decal>|<tail>"; anything that
+    does not split cleanly on the pipe is passed through unchanged rather
+    than being reshaped into a line that might read as a different tail
+    number than the form actually shows."""
+    lines = []
+    for label, value in kept_items:
+        if "decal" not in _normalize(label):
+            continue
+        raw = value.strip()
+        if not raw or raw.lower() in _EMPTY_VALUES:
+            continue
+        decal, sep, tail = raw.partition("|")
+        decal, tail = decal.strip(), tail.strip()
+        if sep and decal and tail:
+            lines.append(f"{tail} - Decal {decal}")
+        else:
+            lines.append(raw)
+    return lines
+
+
+def format_general_comments_section(kept_items: list[tuple[str, str]]) -> list[str]:
+    """Both free-text answers, each on its own labelled line, in the order
+    the questions appear on the form. An unanswered box contributes no
+    line at all rather than an "N/A"."""
+    challenges = ""
+    other = ""
+    for label, value in kept_items:
+        norm = _normalize(label)
+        if "challenge" in norm:
+            challenges = value.strip()
+        elif "other relevant" in norm or "operational preferences" in norm:
+            other = value.strip()
+
+    lines = []
+    if challenges and challenges.lower() not in _EMPTY_VALUES:
+        lines.append(f"Challenges with previous Trip Support Providers: {challenges}")
+    if other and other.lower() not in _EMPTY_VALUES:
+        if lines:
+            lines.append("")
+        lines.append(f"Other operational preferences: {other}")
+    return lines
+
+
+def format_ffm_services_section(kept_items: list[tuple[str, str]]) -> list[str]:
+    """The FFM Services tab block.
+
+    Q1 (opt-out): only says anything when the box is actually ticked --
+    an unchecked box is the default state and adds no line.
+    Q2 (account username): the answer, or an explicit "Not provided", so
+    a missing username is visibly outstanding rather than just absent.
+    Q3 (personnel): one line per row, listed after a blank separator."""
+    opted_out = False
+    username = ""
+    logins: list[str] = []
+
+    for label, value in kept_items:
+        norm = _normalize(label)
+        raw = value.strip()
+        if "opt-out" in norm or "opt out" in norm:
+            opted_out = raw.lower().startswith(("checked", "ticked", "yes"))
+        elif "username" in norm or "foreflight account" in norm:
+            username = raw
+        elif "login" in norm or "web portal" in norm:
+            if raw and raw.lower() not in _EMPTY_VALUES:
+                logins.append(raw)
+
+    lines: list[str] = []
+    if opted_out:
+        lines.append(FFM_OPT_OUT_NOTICE)
+        lines.append("")
+
+    account = username if username and username.lower() not in _EMPTY_VALUES else FFM_USERNAME_NOT_PROVIDED
+    lines.append(f"ForeFlight account username: {account}")
+
+    if logins:
+        lines.append("")
+        lines.append("Web Portal / FFM Services tab logins:")
+        lines.extend(logins)
+    return lines
+
+
 SPECIAL_SECTION_FORMATTERS = {
     "flight monitoring": format_flight_monitoring_section,
     "aircraft details": format_aircraft_details_section,
-    "customs": format_customs_section,
+    # "customs" is NOT listed here -- it feeds two subjects and so is
+    # handled by MULTI_SUBJECT_FORMATTERS, which short-circuits this table.
     "permits": format_permits_section,
+    "general comments": format_general_comments_section,
+    "customer tools": format_ffm_services_section,
     "catering": format_catering_section,
     "ground handling": format_ground_handling_section,
     "company details": format_company_details_section,
@@ -881,14 +1091,20 @@ ACTIVE_CONTENT_SUBJECTS = {
     "Hotels",
     "Ground Transport",
     "Fuel",
+    "Aircraft Decal",
+    "General Comments",
+    "ForeFlight Mobile (FFM) Services tab",
 }
 
 
-def map_to_subjects(sections: list[dict], salesperson: str | None = None) -> dict[str, list[str]]:
+def map_to_subjects(sections: list[dict], salesperson: str | None = None,
+                    jeppesen_acct_nbr: str | None = None,
+                    as_of: date | None = None) -> dict[str, list[str]]:
     """{subject: [formatted comment lines]}, grouped and labeled by
-    source heading so provenance stays traceable. `salesperson` is the
-    name selected in the intake UI, threaded through to General Info's
-    "Jeppesen FF Account Exec" line -- see add_static_content()."""
+    source heading so provenance stays traceable. `salesperson` and
+    `jeppesen_acct_nbr` come from the intake UI rather than the PDF, and
+    `as_of` dates the High Profile Notes header -- all three are threaded
+    through to add_static_content()."""
     by_subject: dict[str, list[str]] = {s: [] for s in SUBJECTS}
     unmapped_headings = set()
     dropped_fields = []
@@ -978,14 +1194,23 @@ def map_to_subjects(sections: list[dict], salesperson: str | None = None) -> dic
             file=sys.stderr,
         )
 
-    add_static_content(by_subject, salesperson=salesperson)
+    add_static_content(by_subject, salesperson=salesperson,
+                       jeppesen_acct_nbr=jeppesen_acct_nbr, as_of=as_of)
     return by_subject
 
 
-def add_static_content(by_subject: dict[str, list[str]], salesperson: str | None = None) -> None:
+def add_static_content(by_subject: dict[str, list[str]], salesperson: str | None = None,
+                       jeppesen_acct_nbr: str | None = None, as_of: date | None = None) -> None:
     """Inject fixed boilerplate that is not derived from the source PDF.
-    Runs on every document, appended after any extracted content."""
-    by_subject.setdefault("High Profile Notes", []).insert(0, HIGH_PROFILE_NOTES_TEMPLATE)
+    Runs on every document, appended after any extracted content.
+
+    `jeppesen_acct_nbr` and `salesperson` both come from the intake form
+    rather than the PDF; `as_of` is the date the run is attributed to (see
+    high_profile_notes())."""
+    by_subject.setdefault("Jeppesen Account Number", []).insert(
+        0, _jeppesen_account_number_line(jeppesen_acct_nbr)
+    )
+    by_subject.setdefault("High Profile Notes", []).insert(0, high_profile_notes(as_of))
     by_subject.setdefault("General Info", []).append(
         "\n".join(_general_info_static_lines(salesperson))
     )
