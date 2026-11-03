@@ -476,36 +476,89 @@ def render_pages(pdf_path: Path, dpi: int = 200) -> list[bytes]:
     return images
 
 
-def extract_page(png_bytes: bytes, client, model: str = MODEL) -> dict:
-    """Send one page image to Claude vision, get back structured JSON."""
+# Ceiling on one page's extraction response. The dense pages -- Customs
+# (eleven fields plus a decals table) and the FFM Services tab (a
+# personnel table) -- produce far more JSON than the rest, and a reply
+# that runs past this limit is cut off mid-token and cannot be parsed.
+# You only pay for tokens actually produced, so unused headroom is free;
+# this is set well above the largest observed page on purpose.
+EXTRACTION_MAX_TOKENS = 8000
+
+# How many times to ask for a page before giving up on it.
+EXTRACTION_ATTEMPTS = 3
+
+
+class PageExtractionError(RuntimeError):
+    """A page could not be read into valid JSON after every attempt.
+
+    Raised rather than returning empty, so the run fails loudly. A
+    skipped page silently produces a workbook that looks complete but is
+    missing a whole section -- for Customs that means regulatory answers
+    quietly rendering as "N/A", which nobody can spot by eye."""
+
+
+def extract_page(png_bytes: bytes, client, model: str = MODEL,
+                 max_tokens: int = EXTRACTION_MAX_TOKENS,
+                 attempts: int = EXTRACTION_ATTEMPTS) -> dict:
+    """Send one page image to Claude vision, get back structured JSON.
+
+    Retries on a truncated or unparseable reply, then raises
+    PageExtractionError. Never returns a partial or empty result for a
+    page it failed to read."""
     b64 = base64.standard_b64encode(png_bytes).decode("ascii")
-    resp = client.messages.create(
-        model=model,
-        max_tokens=2000,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": b64,
+    last_problem = "unknown"
+    last_text = ""
+
+    for attempt in range(1, attempts + 1):
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": b64,
+                            },
                         },
-                    },
-                    {"type": "text", "text": EXTRACTION_PROMPT},
-                ],
-            }
-        ],
+                        {"type": "text", "text": EXTRACTION_PROMPT},
+                    ],
+                }
+            ],
+        )
+
+        text = "".join(block.text for block in resp.content if block.type == "text")
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        last_text = text
+
+        # Checked before parsing: a truncated reply is sometimes still
+        # valid JSON (the cut can land after a closing brace), which would
+        # otherwise look like a clean read of a half-empty page.
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            last_problem = (
+                f"the reply hit the {max_tokens}-token limit and was cut off"
+            )
+            print(f"  [warn] page truncated at max_tokens (attempt {attempt}/{attempts})",
+                  file=sys.stderr)
+            continue
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            last_problem = f"the reply was not valid JSON ({e})"
+            print(f"  [warn] could not parse model output as JSON "
+                  f"(attempt {attempt}/{attempts}): {e}", file=sys.stderr)
+
+    raise PageExtractionError(
+        f"Could not read this page after {attempts} attempts -- {last_problem}. "
+        f"Nothing was written for it, so the run was stopped rather than "
+        f"returning a workbook with a section silently missing. "
+        f"First 200 characters of the last reply: {last_text[:200]!r}"
     )
-    text = "".join(block.text for block in resp.content if block.type == "text")
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"  [warn] could not parse model output as JSON, skipping page:\n{text[:300]}", file=sys.stderr)
-        return {"sections": []}
 
 
 def extract_document(pdf_path: Path, cache_path: Path, use_cache: bool = False) -> list[dict]:

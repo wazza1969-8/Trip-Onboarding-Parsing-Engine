@@ -1117,7 +1117,15 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
             for i, png in enumerate(pages, start=1):
                 if progress_callback is not None:
                     progress_callback(i / len(pages), f"Reading page {i} of {len(pages)}...")
-                result = pe.extract_page(png, client, model=model)
+                try:
+                    result = pe.extract_page(png, client, model=model)
+                except pe.PageExtractionError as e:
+                    # Deliberately fatal. A page that could not be read
+                    # would otherwise vanish from the workbook without
+                    # trace -- Customs would render as a column of "N/A"
+                    # and look like a customer who answered nothing.
+                    # Naming the page tells whoever retries where to look.
+                    raise RuntimeError(f"Page {i} of {len(pages)}: {e}") from e
                 for section in result.get("sections", []):
                     section["page"] = i
                     sections.append(section)
