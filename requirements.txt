@@ -1,35 +1,4 @@
-# Pinned deliberately -- see the note below before loosening anything.
-#
-# Streamlit Community Cloud re-resolves this file on EVERY reboot, so
-# unpinned versions mean a reboot can silently move the running app to
-# different library versions. That is a real hazard regardless of which
-# version is chosen, which is why this stays pinned.
-#
-# Why 1.66.1 specifically:
-#   * Okta sign-in was observed working on 1.66.1 on this deployment.
-#   * streamlit/streamlit#16569 reports OIDC login hanging when the
-#     identity provider returns large tokens (a corporate Okta tenant
-#     with many group claims does exactly that) -- the cookie outgrows
-#     the WebSocket header limit and the app hangs on a blank spinner.
-#     The fix, PR #17114, was built against the 1.66 line, so 1.66.1
-#     carries it and anything older does not.
-#
-# This file previously pinned 1.56.0, chosen to dodge the "Invalid code
-# verifier" bug introduced in 1.57.0 (streamlit/streamlit#15115). That
-# was the wrong trade: it avoided one bug while reintroducing #16569,
-# and the failures that prompted it were later traced to stale browser
-# cache rather than to Streamlit at all.
-#
-# The [auth] extra is the documented way to install Authlib at a version
-# Streamlit itself considers compatible, rather than pinning Authlib
-# separately and guessing.
-streamlit[auth]==1.66.1
-
-# Left unpinned on purpose. None of these is implicated in the auth
-# failure, and pinning them to versions nobody has verified against this
-# deployment would trade a known problem for an unknown one. Pinning them
-# properly needs a lockfile captured from a deploy that is confirmed
-# working -- worth doing, but as a separate deliberate step.
+streamlit>=1.42.0
 anthropic[bedrock]
 pymupdf
 openpyxl
