@@ -102,15 +102,16 @@ SUBJECTS = [
     "Customs Information",
     "Catering",
     "Ground Transport",
-    "Sponsor Information",
-    "Emergency Procedures",
-    "FP - General Procedures",
-    "FP - Options/Formats",
-    "FP - Aircraft Databases",
-    "FP - Alternate Airports",
-    "FP - Preferred Routing",
-    "FP - Weather Packages",
-    "FP - Remarks",
+    # Removed from the output: Sponsor Information, Emergency Procedures,
+    # FP - General Procedures, FP - Options/Formats, FP - Aircraft
+    # Databases, FP - Alternate Airports, FP - Preferred Routing,
+    # FP - Weather Packages and FP - Remarks. This source document type
+    # carries no per-trip flight-plan detail, so all nine always rendered
+    # as empty rows. They were previously kept as blanks to mirror the
+    # Operational Information grid; they are now dropped entirely at the
+    # business's request. To bring any of them back, add the name here --
+    # nothing else needs changing, since none of them was ever mapped or
+    # whitelisted.
     # The three trailing sections, in this fixed order. All are fed from
     # the source PDF like the rest -- they sit at the end because that is
     # where the business wants them on the sheet, not because they are
@@ -140,8 +141,7 @@ SECTION_MAP = {
     "catering": "Catering",
     "ground transport": "Ground Transport",
     # General Comments has its own output subject. It used to feed
-    # "FP - Remarks"; that subject is left in the sheet but now receives
-    # nothing, alongside the other FP- subjects this form does not cover.
+    # "FP - Remarks", which has since been removed from the sheet.
     "general comments": "General Comments",
     "customer tools": "ForeFlight Mobile (FFM) Services tab",
 }
@@ -250,23 +250,15 @@ FIELD_WHITELIST = {
 }
 
 
-# Subjects this source-document type is not expected to cover at all
-# (e.g. a company preferences form has no per-trip flight-plan detail).
-# Left blank in output rather than guessed at.
-NOT_COVERED_BY_THIS_DOC_TYPE = {
-    "Sponsor Information",
-    "Emergency Procedures",
-    "FP - General Procedures",
-    "FP - Options/Formats",
-    "FP - Aircraft Databases",
-    "FP - Alternate Airports",
-    "FP - Preferred Routing",
-    "FP - Weather Packages",
-    # Used to receive the General Comments answers; those now have their
-    # own "General Comments" subject, so this one is left in the sheet but
-    # always blank, like the rest of the FP- family.
-    "FP - Remarks",
-}
+# Subjects this source-document type is not expected to cover at all.
+# Now empty: every subject that used to be listed here (Sponsor
+# Information, Emergency Procedures and the FP- family) has been removed
+# from SUBJECTS altogether rather than carried as a blank row -- see the
+# note in SUBJECTS above. Kept as an empty set, with this explanation,
+# because it documents a real property of this document type and is the
+# right place to list a subject that a future source form covers only
+# sometimes.
+NOT_COVERED_BY_THIS_DOC_TYPE: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # 3. Static / boilerplate content -- NOT derived from the source PDF.
