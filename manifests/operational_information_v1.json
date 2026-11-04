@@ -1,5 +1,5 @@
 {
-  "manifest_version": "1.1.0",
+  "manifest_version": "1.2.0",
   "target_id": "operational_information_workbook",
   "target_name": "Operational Information Workbook",
   "target_kind": "workbook",
@@ -1020,16 +1020,7 @@
       ]
     }
   ],
-  "not_covered_by_source_form": [
-    "Sponsor Information",
-    "Emergency Procedures",
-    "FP - General Procedures",
-    "FP - Options/Formats",
-    "FP - Aircraft Databases",
-    "FP - Alternate Airports",
-    "FP - Preferred Routing",
-    "FP - Weather Packages"
-  ],
+  "not_covered_by_source_form": [],
   "present_in_source_but_not_extracted": [
     {
       "source_section": "aircraft details",
