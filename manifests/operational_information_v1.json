@@ -1,0 +1,1105 @@
+{
+  "manifest_version": "1.1.0",
+  "target_id": "operational_information_workbook",
+  "target_name": "Operational Information Workbook",
+  "target_kind": "workbook",
+  "target_verified": true,
+  "target_verification_note": "Sections and their order are taken from parsing_engine.SUBJECTS, which the engine documents as 'must match the Operational Information grid', and are confirmed against Fore_Flight_Operational_Info.xlsx in this repository. Field-level source labels are taken verbatim from parsing_engine.FIELD_WHITELIST, which was built against the source form named below. No portal field IDs, portal labels, portal enums or portal required-flags appear in this manifest, because no destination-portal specification has been obtained.",
+  "source_form": "Jeppesen ForeFlight Trip Support Service Preferences (Ver 2.2)",
+  "created": "2026-09-18",
+  "sections": [
+    {
+      "section_id": "company_details",
+      "label": "Company Details",
+      "order": 1,
+      "fields": [
+        {
+          "field_id": "company_name",
+          "target_label": "Company Name",
+          "order": 1,
+          "source": {
+            "section": "company details",
+            "label": "Company Name"
+          },
+          "data_type": "text",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "text",
+          "validators": [
+            "non_empty"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "company_address",
+          "target_label": "Company Address",
+          "order": 2,
+          "source": {
+            "section": "company details",
+            "label": "Company Address"
+          },
+          "data_type": "text",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "text",
+          "validators": [
+            "non_empty"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "home_base",
+          "target_label": "Home Base",
+          "order": 3,
+          "source": {
+            "section": "company details",
+            "label": "Home Base(s) ICAO(s)"
+          },
+          "data_type": "icao",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "icao",
+          "validators": [
+            "icao_format"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "parsing_engine.format_company_details_section() emits this only when the value is exactly 4 alphanumeric characters; multi-airport answers are withheld rather than shown malformed."
+        }
+      ]
+    },
+    {
+      "section_id": "communications",
+      "label": "Communications",
+      "order": 2,
+      "fields": [
+        {
+          "field_id": "ops_team_flag",
+          "target_label": "Operations team?",
+          "order": 1,
+          "source": {
+            "section": "company details",
+            "label": "Operations team?"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "Gating field: Ops Team Contact is emitted only when this is Yes and the email below is non-empty."
+        },
+        {
+          "field_id": "ops_team_email",
+          "target_label": "Ops Team Contact",
+          "order": 2,
+          "source": {
+            "section": "company details",
+            "label": "Ops team email"
+          },
+          "data_type": "email",
+          "required": false,
+          "criticality": "required_noncritical",
+          "normalizer": "email",
+          "validators": [
+            "email_format"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "conditional_on": {
+            "field_id": "ops_team_flag",
+            "equals": "Yes"
+          }
+        },
+        {
+          "field_id": "key_contacts",
+          "target_label": "Key Contact",
+          "order": 3,
+          "source": {
+            "section": "company details",
+            "label": "Key contact"
+          },
+          "data_type": "contact_list",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "contact",
+          "validators": [
+            "non_empty"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "repeating": true
+        },
+        {
+          "field_id": "billing_contacts",
+          "target_label": "Billing Contact",
+          "order": 4,
+          "source": {
+            "section": "company details",
+            "label": "Billing contact"
+          },
+          "data_type": "contact_list",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "contact",
+          "validators": [
+            "non_empty"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "repeating": true
+        }
+      ]
+    },
+    {
+      "section_id": "high_profile_notes",
+      "label": "High Profile Notes",
+      "order": 3,
+      "static_only": true,
+      "fields": []
+    },
+    {
+      "section_id": "general_info",
+      "label": "General Info",
+      "order": 4,
+      "fields": [
+        {
+          "field_id": "flight_types",
+          "target_label": "Customer operates",
+          "order": 1,
+          "source": {
+            "section": "aircraft details",
+            "label": "Flight types operated"
+          },
+          "data_type": "enum_multi",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "flight_types",
+          "validators": [
+            "enum_member"
+          ],
+          "permitted_values_source": "parsing_engine.FLIGHT_TYPE_OPTIONS",
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "Permitted values are read at runtime from parsing_engine.FLIGHT_TYPE_OPTIONS rather than duplicated here, so the manifest cannot drift from the engine."
+        }
+      ]
+    },
+    {
+      "section_id": "flight_following",
+      "label": "Flight Following",
+      "order": 5,
+      "fields": [
+        {
+          "field_id": "movement_optout",
+          "target_label": "Movement messages opt-out",
+          "order": 1,
+          "source": {
+            "section": "flight monitoring",
+            "label": "Movement messages opt-out checkbox"
+          },
+          "data_type": "checkbox",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "checkbox",
+          "validators": [
+            "checkbox_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "movements_added_service",
+          "target_label": "Send movements as an added service",
+          "order": 2,
+          "source": {
+            "section": "flight monitoring",
+            "label": "Send movements as an added service"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        }
+      ]
+    },
+    {
+      "section_id": "ground_handling",
+      "label": "Ground Handling",
+      "order": 6,
+      "fields": [
+        {
+          "field_id": "towbar_carried",
+          "target_label": "Towbar carried",
+          "order": 1,
+          "source": {
+            "section": "ground handling",
+            "label": "Towbar carried checkbox"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "towbar_tails",
+          "target_label": "Aircraft tails with towbars",
+          "order": 2,
+          "source": {
+            "section": "ground handling",
+            "label": "Aircraft tails with towbars"
+          },
+          "data_type": "registration_list",
+          "required": false,
+          "criticality": "critical",
+          "normalizer": "registration_list",
+          "validators": [
+            "registration_format"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "conditional_on": {
+            "field_id": "towbar_carried",
+            "equals": "Yes"
+          }
+        }
+      ]
+    },
+    {
+      "section_id": "permits",
+      "label": "Permits",
+      "order": 7,
+      "fields": [
+        {
+          "field_id": "countries_avoid",
+          "target_label": "Countries to avoid overflying",
+          "order": 1,
+          "source": {
+            "section": "permits",
+            "label": "Countries to avoid overflying"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "critical",
+          "normalizer": "strip_yes_prefix",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "block_permissions",
+          "target_label": "Block (seasonal) permissions held",
+          "order": 2,
+          "source": {
+            "section": "permits",
+            "label": "Block (seasonal) permissions held"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "strip_yes_prefix",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        }
+      ]
+    },
+    {
+      "section_id": "hotels",
+      "label": "Hotels",
+      "order": 8,
+      "fields": [
+        {
+          "field_id": "hotels_required_for",
+          "target_label": "Hotels required for",
+          "order": 1,
+          "source": {
+            "section": "hotels",
+            "label": "Hotels required for"
+          },
+          "data_type": "enum_multi",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "who_list",
+          "validators": [
+            "enum_member"
+          ],
+          "permitted_values": [
+            "Crew",
+            "Passengers"
+          ],
+          "permitted_values_verified": false,
+          "availability": "extracted",
+          "verification": "provisional",
+          "notes": "Permitted values inferred from observed sample data only. Not confirmed against a form specification."
+        },
+        {
+          "field_id": "hotel_options_prior",
+          "target_label": "Hotel options sent prior to booking",
+          "order": 2,
+          "source": {
+            "section": "hotels",
+            "label": "Hotel options sent prior to booking"
+          },
+          "data_type": "yes_no",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "preferred_hotel_chain",
+          "target_label": "Preferred hotel chain",
+          "order": 3,
+          "source": {
+            "section": "hotels",
+            "label": "Preferred hotel chain"
+          },
+          "data_type": "text_list",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "repeating": true
+        },
+        {
+          "field_id": "hotel_price_range",
+          "target_label": "Hotel price range",
+          "order": 4,
+          "source": {
+            "section": "hotels",
+            "label": "Hotel price range"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "room_type_pref",
+          "target_label": "Room type preference",
+          "order": 5,
+          "source": {
+            "section": "hotels",
+            "label": "Room type preference"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "min_star_rating",
+          "target_label": "Minimum hotel star rating",
+          "order": 6,
+          "source": {
+            "section": "hotels",
+            "label": "Minimum hotel star rating"
+          },
+          "data_type": "star_rating",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "star_rating",
+          "validators": [
+            "star_rating_range"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "location_1_night",
+          "target_label": "Location for stays of 1 night",
+          "order": 7,
+          "source": {
+            "section": "hotels",
+            "label": "Location for stays of 1 night"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "location_multi_night",
+          "target_label": "Location for stays of more than 1 night",
+          "order": 8,
+          "source": {
+            "section": "hotels",
+            "label": "Location for stays of more than 1 night"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "hotel_payment_pref",
+          "target_label": "Payment preference",
+          "order": 9,
+          "source": {
+            "section": "hotels",
+            "label": "Payment preference"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "required_noncritical",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "early_am_booking",
+          "target_label": "Book room the night before for early AM arrival",
+          "order": 10,
+          "source": {
+            "section": "hotels",
+            "label": "Book room the night before for early AM arrival"
+          },
+          "data_type": "yes_no",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "early_am_criteria",
+          "target_label": "Early AM arrival criteria",
+          "order": 11,
+          "source": {
+            "section": "hotels",
+            "label": "Early AM arrival criteria"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "conditional_on": {
+            "field_id": "early_am_booking",
+            "equals": "Yes"
+          }
+        }
+      ]
+    },
+    {
+      "section_id": "fuel",
+      "label": "Fuel",
+      "order": 9,
+      "fields": [
+        {
+          "field_id": "preferred_fuel_provider",
+          "target_label": "Preferred Fuel Provider",
+          "order": 1,
+          "source": {
+            "section": "fuel",
+            "label": "Preferred fuel provider"
+          },
+          "data_type": "text",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "parsing_engine.format_fuel_section() falls back to 'N/A' when unanswered; the entry-ready view reports it as missing rather than reproducing the fallback."
+        }
+      ]
+    },
+    {
+      "section_id": "customs_information",
+      "label": "Customs Information",
+      "order": 10,
+      "field_order_is_fixed": true,
+      "fields": [
+        {
+          "field_id": "usa_customs_notification",
+          "target_label": "USA Customs Notification",
+          "order": 1,
+          "source": {
+            "section": "customs",
+            "label": "USA Customs Notification"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "eapis_usa",
+          "target_label": "eAPIS (USA)",
+          "order": 2,
+          "source": {
+            "section": "customs",
+            "label": "eAPIS (USA)"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "eapis_other",
+          "target_label": "eAPIS (other countries)",
+          "order": 3,
+          "source": {
+            "section": "customs",
+            "label": "eAPIS (other countries)"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "uk_apd",
+          "target_label": "UK Air Passenger Duty (APD)",
+          "order": 4,
+          "source": {
+            "section": "customs",
+            "label": "UK Air Passenger Duty (APD)"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "uk_gar",
+          "target_label": "UK General Avtn Report (GAR)",
+          "order": 5,
+          "source": {
+            "section": "customs",
+            "label": "UK General Avtn Report (GAR)"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "usa_tsa_waiver",
+          "target_label": "USA TSA Waiver held",
+          "order": 6,
+          "source": {
+            "section": "customs",
+            "label": "USA TSA Waiver held"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "usa_cbp_exemption",
+          "target_label": "USA CBP Border Overflight Exemption held",
+          "order": 7,
+          "source": {
+            "section": "customs",
+            "label": "USA CBP Border Overflight Exemption held"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "vwp_signatory",
+          "target_label": "Visa Waiver Program Signatory Carrier",
+          "order": 8,
+          "source": {
+            "section": "customs",
+            "label": "Visa Waiver Program Signatory Carrier"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "tco",
+          "target_label": "Third Country Operator (TCO)",
+          "order": 9,
+          "source": {
+            "section": "customs",
+            "label": "Third Country Operator (TCO)"
+          },
+          "data_type": "yes_no",
+          "required": true,
+          "criticality": "critical",
+          "normalizer": "yes_no",
+          "validators": [
+            "yes_no_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "apis_carrier_code",
+          "target_label": "APIS Carrier code",
+          "order": 10,
+          "source": {
+            "section": "customs",
+            "label": "APIS Carrier code"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "critical",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        }
+      ]
+    },
+    {
+      "section_id": "catering",
+      "label": "Catering",
+      "order": 11,
+      "fields": [
+        {
+          "field_id": "catering_required_for",
+          "target_label": "Catering required for",
+          "order": 1,
+          "source": {
+            "section": "catering",
+            "label": "Catering required for"
+          },
+          "data_type": "enum_multi",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "who_list",
+          "validators": [
+            "enum_member"
+          ],
+          "permitted_values": [
+            "Crew",
+            "Passengers"
+          ],
+          "permitted_values_verified": false,
+          "availability": "extracted",
+          "verification": "provisional",
+          "notes": "Permitted values inferred from observed sample data only."
+        }
+      ]
+    },
+    {
+      "section_id": "ground_transport",
+      "label": "Ground Transport",
+      "order": 12,
+      "fields": [
+        {
+          "field_id": "transport_required_for",
+          "target_label": "Transport required for",
+          "order": 1,
+          "source": {
+            "section": "ground transport",
+            "label": "Transport required for"
+          },
+          "data_type": "enum_multi",
+          "required": true,
+          "criticality": "required_noncritical",
+          "normalizer": "who_list",
+          "validators": [
+            "enum_member"
+          ],
+          "permitted_values": [
+            "Crew",
+            "Passengers"
+          ],
+          "permitted_values_verified": false,
+          "availability": "extracted",
+          "verification": "provisional"
+        },
+        {
+          "field_id": "crew_pickup_after_arrival",
+          "target_label": "Crew pickup time after aircraft arrival",
+          "order": 2,
+          "source": {
+            "section": "ground transport",
+            "label": "Crew pickup time after aircraft arrival"
+          },
+          "data_type": "duration",
+          "required": false,
+          "criticality": "required_noncritical",
+          "normalizer": "duration_hours",
+          "validators": [
+            "duration_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "crew_dropoff_before_departure",
+          "target_label": "Crew drop-off time before departure",
+          "order": 3,
+          "source": {
+            "section": "ground transport",
+            "label": "Crew drop-off time before departure"
+          },
+          "data_type": "duration",
+          "required": false,
+          "criticality": "required_noncritical",
+          "normalizer": "duration_hours",
+          "validators": [
+            "duration_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "crew_transport_mode",
+          "target_label": "Mode of transport for crew",
+          "order": 4,
+          "source": {
+            "section": "ground transport",
+            "label": "Mode of transport for crew"
+          },
+          "data_type": "text_list",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "pax_transport_mode",
+          "target_label": "Mode of transport for passengers",
+          "order": 5,
+          "source": {
+            "section": "ground transport",
+            "label": "Mode of transport for passengers"
+          },
+          "data_type": "text_list",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "car_rental_companies",
+          "target_label": "Preferred car rental companies",
+          "order": 6,
+          "source": {
+            "section": "ground transport",
+            "label": "Preferred car rental companies"
+          },
+          "data_type": "text_list",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        },
+        {
+          "field_id": "preferred_car_type",
+          "target_label": "Preferred car type",
+          "order": 7,
+          "source": {
+            "section": "ground transport",
+            "label": "Preferred car type"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified"
+        }
+      ]
+    },
+    {
+      "section_id": "general_comments",
+      "label": "General Comments",
+      "order": 13,
+      "fields": [
+        {
+          "field_id": "provider_challenges",
+          "target_label": "Challenges with previous Trip Support Providers",
+          "order": 1,
+          "source": {
+            "section": "general comments",
+            "label": "Challenges with other Trip Support Providers"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "Question 1 of the General Comments Section."
+        },
+        {
+          "field_id": "other_operational_preferences",
+          "target_label": "Other operational preferences",
+          "order": 2,
+          "source": {
+            "section": "general comments",
+            "label": "Other relevant operational preferences"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "optional",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "Question 2 of the General Comments Section (VAT number, hotel reward cards, anything not covered elsewhere)."
+        }
+      ]
+    },
+    {
+      "section_id": "aircraft_decal",
+      "label": "Aircraft Decal",
+      "order": 14,
+      "fields": [
+        {
+          "field_id": "customs_decals",
+          "target_label": "Aircraft Decal",
+          "order": 1,
+          "source": {
+            "section": "customs",
+            "label": "Annual USA Customs Decals held"
+          },
+          "data_type": "decal_list",
+          "required": false,
+          "criticality": "critical",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "repeating": true,
+          "notes": "One row per annual USA Customs decal, rendered tail-first as '<tail> - Decal <number>'. The Customs page feeds both this subject and Customs Information."
+        }
+      ]
+    },
+    {
+      "section_id": "ffm_services_tab",
+      "label": "ForeFlight Mobile (FFM) Services tab",
+      "order": 15,
+      "fields": [
+        {
+          "field_id": "ffm_opt_out",
+          "target_label": "FFM opt-out",
+          "order": 1,
+          "source": {
+            "section": "customer tools",
+            "label": "FFM Services tab opt-out checkbox"
+          },
+          "data_type": "checkbox",
+          "required": false,
+          "criticality": "critical",
+          "normalizer": "checkbox",
+          "validators": [
+            "checkbox_resolved"
+          ],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "Only produces output when checked, as the all-caps notice USER HAS OPTED OUT OF HAVING FFD CONNECTED TO FSP. Unchecked adds nothing."
+        },
+        {
+          "field_id": "ffm_username",
+          "target_label": "ForeFlight account username",
+          "order": 2,
+          "source": {
+            "section": "customer tools",
+            "label": "ForeFlight account username"
+          },
+          "data_type": "text",
+          "required": false,
+          "criticality": "required_noncritical",
+          "normalizer": "text",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "notes": "Renders 'Not provided' when the question was left blank."
+        },
+        {
+          "field_id": "ffm_logins",
+          "target_label": "Web Portal / FFM Services tab logins",
+          "order": 3,
+          "source": {
+            "section": "customer tools",
+            "label": "Web Portal / FFM Services tab login"
+          },
+          "data_type": "contact_list",
+          "required": false,
+          "criticality": "required_noncritical",
+          "normalizer": "contact",
+          "validators": [],
+          "availability": "extracted",
+          "verification": "verified",
+          "repeating": true,
+          "notes": "One row per person, carrying the three Yes/No access flags."
+        }
+      ]
+    }
+  ],
+  "not_covered_by_source_form": [
+    "Sponsor Information",
+    "Emergency Procedures",
+    "FP - General Procedures",
+    "FP - Options/Formats",
+    "FP - Aircraft Databases",
+    "FP - Alternate Airports",
+    "FP - Preferred Routing",
+    "FP - Weather Packages"
+  ],
+  "present_in_source_but_not_extracted": [
+    {
+      "source_section": "aircraft details",
+      "source_label": "Manufacturer",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "aircraft details",
+      "source_label": "Aircraft Type",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "aircraft details",
+      "source_label": "Aircraft Tail(s)",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "aircraft details",
+      "source_label": "Callsign",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "aircraft details",
+      "source_label": "MTOW",
+      "reason": "not on FIELD_WHITELIST; units are not stated on the source form, so the value cannot be normalized unambiguously"
+    },
+    {
+      "source_section": "core service preferences",
+      "source_label": "(all fields)",
+      "reason": "section not on FIELD_WHITELIST; not approved for automatic extraction"
+    },
+    {
+      "source_section": "ground handling",
+      "source_label": "Preferred Handling Agents",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "ground handling",
+      "source_label": "Additional Ground Equipment requirements (Business/GA)",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "catering",
+      "source_label": "Catering preferences / special requirements",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "fuel",
+      "source_label": "Existing fuel customer of",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "fuel",
+      "source_label": "Fuel carnet card/account",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "hotels",
+      "source_label": "Hotel Membership Reward Cards",
+      "reason": "intentionally excluded per FIELD_WHITELIST comment"
+    },
+    {
+      "source_section": "flight monitoring",
+      "source_label": "Automated OOOI messaging setup on aircraft",
+      "reason": "not on FIELD_WHITELIST"
+    },
+    {
+      "source_section": "flight monitoring",
+      "source_label": "Email addresses for movements",
+      "reason": "not on FIELD_WHITELIST"
+    }
+  ]
+}

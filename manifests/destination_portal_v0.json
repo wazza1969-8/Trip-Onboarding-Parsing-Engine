@@ -1,0 +1,19 @@
+{
+  "manifest_version": "0.0.0",
+  "target_id": "destination_portal",
+  "target_name": "Destination Trip-Support Portal (NOT YET SPECIFIED)",
+  "target_kind": "portal",
+  "target_verified": false,
+  "target_verification_note": "PLACEHOLDER. No destination-portal specification has been obtained: the portal has not been named, no non-production instance has been accessed, and no field discovery has been performed. This file exists only so the loader has a registered slot for the portal target and so it is obvious that the portal manifest is missing rather than merely empty. Do not populate it by inference. Populate it only from an authorised discovery pass against a non-production instance, or from a specification supplied by the system's owning team.",
+  "source_form": null,
+  "created": "2026-09-18",
+  "required_before_use": [
+    "Name the destination portal and confirm a non-production instance is available.",
+    "Obtain written consent from the owning team to automate against it.",
+    "Run a discovery pass capturing, for every field: portal field id, exact visible label, section, display order, data type, required flag, permitted values for every dropdown/enumeration, conditional dependencies, and the portal's validation, error and success states.",
+    "Have a human review and approve the resulting manifest before any field is mapped automatically."
+  ],
+  "sections": [],
+  "not_covered_by_source_form": [],
+  "present_in_source_but_not_extracted": []
+}
