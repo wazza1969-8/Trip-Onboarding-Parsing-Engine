@@ -1,4 +1,27 @@
-streamlit[auth]>=1.42.0
+# PINNED DELIBERATELY -- read this before changing anything here.
+#
+# Two things in this file are load-bearing:
+#
+# 1. The [auth] extra. It is what installs Authlib, which st.login()
+#    requires. Without it Okta sign-in dies with
+#    StreamlitMissingAuthlibError. A plain "streamlit" line appeared to
+#    work for a while only because the running container still had
+#    Authlib from an earlier install -- the next rebuild removed it and
+#    took sign-in down. Do not drop [auth].
+#
+# 2. The exact version. Streamlit Community Cloud re-resolves this file
+#    on EVERY reboot, so an unpinned line means a reboot can silently
+#    move the app to a different Streamlit version. That is how a
+#    working deployment became a broken one with no code change.
+#    1.66.1 is pinned because it is the version this deployment was
+#    observed running with Okta sign-in working.
+streamlit[auth]==1.66.1
+
+# Left unpinned on purpose. None of these is implicated in the auth or
+# rendering problems, and pinning them to versions nobody has verified
+# against this deployment would trade a known-good state for an unknown
+# one. Doing it properly needs a lockfile captured from a deploy that is
+# confirmed working -- worth doing, as its own deliberate step.
 anthropic[bedrock]
 pymupdf
 openpyxl
