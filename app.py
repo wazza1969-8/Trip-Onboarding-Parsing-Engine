@@ -54,6 +54,7 @@ Deploying for a few users
 """
 
 import hmac
+import json
 import os
 import uuid
 
@@ -191,6 +192,207 @@ def render_editable_report_form(submitter: str, period_id: str, key_prefix: str)
             st.rerun()
         except backend.PeriodLockedError as e:
             st.error(str(e))
+
+
+def render_entry_ready_view(sections: list[dict], key_prefix: str) -> None:
+    """Renders one parsed document in the destination's field order.
+
+    Read-only by design: this view exists so a person can transcribe
+    accurately, so it must never be the place a value gets quietly
+    changed. Everything it shows is either a normalized value or a flag
+    saying why a value could not be normalized -- and the original
+    extracted text is always one click away underneath, so a reviewer
+    can check the engine's reading without reopening the PDF.
+
+    Imported lazily so app.py still starts if entry_ready.py /
+    field_manifest.py / the manifests folder haven't been deployed --
+    only this tab breaks, rather than the whole app."""
+    try:
+        import entry_ready as er
+        import field_manifest as fm
+    except ImportError as e:
+        st.error(
+            "This view needs `entry_ready.py`, `field_manifest.py` and the "
+            f"`manifests/` folder deployed alongside app.py. Missing: {e.name}"
+        )
+        return
+
+    try:
+        target_ids = fm.available_manifests()
+    except Exception as e:
+        st.error(f"Could not read the manifests folder: {e}")
+        return
+
+    verified, unverified, placeholder = {}, {}, {}
+    for tid in target_ids:
+        try:
+            m = fm.load_manifest(tid)
+        except fm.ManifestError as e:
+            st.warning(f"Skipping an unreadable manifest: {e}")
+            continue
+        if not m.is_usable():
+            placeholder[f"{m.target_name}  (not yet specified)"] = tid
+        elif m.target_verified:
+            verified[m.target_name] = tid
+        else:
+            unverified[m.target_name] = tid
+
+    # Order matters: whatever lands first becomes the default selection.
+    # Verified destinations first, then usable-but-unverified ones (a mock
+    # or a provisional spec), then empty placeholders. Without the
+    # verified/unverified split a mock manifest dropped into the folder
+    # could silently become the default destination, which is exactly the
+    # kind of thing nobody notices until a record is typed from it.
+    # Placeholders stay listed -- their absence is information -- but they
+    # can never be the default.
+    labels = {**verified, **unverified, **placeholder}
+    if not labels:
+        st.error("No usable destination manifests could be loaded.")
+        return
+
+    choice = st.selectbox("Destination", list(labels), key=f"{key_prefix}_target")
+    manifest = fm.load_manifest(labels[choice])
+
+    if not manifest.is_usable():
+        st.warning(
+            f"**{manifest.target_name}** has no field specification yet, so there is "
+            "nothing to map against. This is deliberate -- the layout has not been "
+            "invented in its absence."
+        )
+        if manifest.required_before_use:
+            st.caption("Needed before this destination can be used:")
+            for step in manifest.required_before_use:
+                st.caption(f"• {step}")
+        return
+
+    records = er.build_entry_ready_records(sections, manifest)
+    summary = er.summarize(records)
+
+    st.caption(
+        f"{manifest.target_name} · manifest v{manifest.manifest_version} · "
+        f"{'verified' if manifest.target_verified else 'UNVERIFIED'} against "
+        f"{manifest.source_form or 'an unspecified source form'}"
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Ready to enter", f"{summary.ready}/{summary.total}")
+    m2.metric("Needs review", summary.needs_review)
+    m3.metric("Missing required", summary.missing_required)
+    m4.metric("Provisional", summary.provisional)
+
+    if summary.blocked_on_critical:
+        st.error(
+            f"{summary.blocked_on_critical} critical field(s) are unresolved. "
+            "Critical fields are operational and regulatory identifiers -- resolve "
+            "each one against the source document before entering this record."
+        )
+    elif summary.needs_review:
+        st.warning(f"{summary.needs_review} field(s) need a human decision before entry.")
+    else:
+        st.success("Every mapped field normalized cleanly. Check it against the source anyway.")
+
+    with st.expander("Completion by criticality"):
+        for level, counts in summary.by_criticality.items():
+            total = counts["total"]
+            pct = (counts["ready"] / total * 100) if total else 0
+            st.write(
+                f"**{level.replace('_', ' ').title()}** — {counts['ready']}/{total} ready "
+                f"({pct:.0f}%) · {counts['needs_review']} need review · "
+                f"{counts['missing_required']} missing required"
+            )
+        st.caption(
+            "Reported separately on purpose. A blended percentage hides the case that "
+            "matters: an ICAO code or customs declaration being wrong is not offset by "
+            "hotel preferences being right."
+        )
+
+    show_all = st.checkbox(
+        "Show fields with no value", value=False, key=f"{key_prefix}_show_all",
+        help="Off by default so the list matches what you actually have to type.",
+    )
+
+    status_icon = {
+        er.OK: "✅", er.AMBIGUOUS: "⚠️", er.INVALID: "⛔",
+        er.MISSING: "○", er.NOT_APPLICABLE: "—",
+    }
+
+    for section in manifest.sections:
+        section_records = [r for r in records if r.section_id == section.section_id]
+        if not section_records:
+            continue
+        visible = section_records if show_all else [
+            r for r in section_records if r.status != er.MISSING or r.required
+        ]
+        if not visible:
+            continue
+
+        st.markdown(f"##### {section.label}")
+        if section.field_order_is_fixed:
+            st.caption("Field order below is fixed by the destination and must be preserved.")
+
+        for rec in visible:
+            icon = status_icon.get(rec.status, "")
+            flags = []
+            if rec.required:
+                flags.append("required")
+            if rec.criticality == "critical":
+                flags.append("critical")
+            if rec.is_provisional:
+                flags.append("provisional mapping")
+            flag_text = f"  ·  _{', '.join(flags)}_" if flags else ""
+
+            st.markdown(f"**{icon} {rec.target_label}**{flag_text}")
+
+            if rec.status == er.OK:
+                # st.code gives a copy-to-clipboard button for free, which is
+                # the whole point of this view -- one click per field, no
+                # selecting text out of a paragraph.
+                st.code(rec.value, language=None)
+            elif rec.status == er.AMBIGUOUS:
+                st.warning(f"Needs a decision: {rec.reason}")
+                st.code(rec.value, language=None)
+            elif rec.status == er.INVALID:
+                st.error(f"Will not normalize: {rec.reason}")
+                if rec.original_value:
+                    st.code(rec.original_value, language=None)
+            elif rec.status == er.NOT_APPLICABLE:
+                st.caption(rec.reason or "Not applicable.")
+            else:
+                st.caption(
+                    ("⚠️ Required, and not answered on the source form. "
+                     if rec.required else "Not answered on the source form. ")
+                    + "Left blank rather than guessed."
+                )
+
+            src = " › ".join(p for p in (rec.source_section, rec.source_label) if p)
+            page = f" · page {rec.source_page}" if rec.source_page else ""
+            with st.expander(f"Source: {src or 'unmapped'}{page}", expanded=False):
+                if rec.original_value:
+                    st.text(rec.original_value)
+                else:
+                    st.caption("Nothing was extracted for this field.")
+                if rec.is_provisional:
+                    st.caption(
+                        "This mapping is provisional — its destination label or its "
+                        "permitted values were inferred from sample data, not taken "
+                        "from a specification. Confirm before relying on it."
+                    )
+
+    if manifest.present_in_source_but_not_extracted:
+        with st.expander("On the source form but deliberately not extracted"):
+            st.caption(
+                "These are still manual. They are not bugs — each is excluded by the "
+                "engine's field whitelist, which is the control that stops unapproved "
+                "fields flowing through automatically."
+            )
+            for item in manifest.present_in_source_but_not_extracted:
+                st.write(f"**{item.get('source_label')}** ({item.get('source_section')}) — {item.get('reason')}")
+
+    if manifest.not_covered_by_source_form:
+        with st.expander("Destination sections this form does not cover"):
+            for name in manifest.not_covered_by_source_form:
+                st.write(f"• {name}")
+            st.caption("Left blank in the workbook rather than guessed at.")
 
 
 def render_report_readonly(row) -> None:
@@ -574,7 +776,9 @@ task = st.session_state["task"]
 # Trip Preference Parsing -- fully wired to the existing pipeline
 # ---------------------------------------------------------------------------
 if task == "Trip Preference Parsing":
-    tab_new, tab_requests = st.tabs(["Submit New Request", "My Requests"])
+    tab_new, tab_requests, tab_entry = st.tabs(
+        ["Submit New Request", "My Requests", "Entry-Ready View"]
+    )
 
     with tab_new:
         # Plain widgets (not st.form) on purpose: inside a form, Streamlit
@@ -730,11 +934,21 @@ if task == "Trip Preference Parsing":
                     def _on_progress(fraction, text):
                         bar.progress(fraction, text=text)
 
+                    # Keep the raw extraction for this browser session only,
+                    # so the Entry-Ready View has field-level label/value
+                    # pairs to work from. It is NOT written to the database
+                    # -- persisting it would need a schema change and a
+                    # deliberate decision, since the extraction contains
+                    # customer PII in structured, queryable form.
+                    def _keep_sections(sections, _rid=request_id):
+                        st.session_state.setdefault("parsed_sections", {})[_rid] = sections
+
                     backend.run_parsing(
                         request_id, onboarding_bytes,
                         progress_callback=_on_progress,
                         secrets_getter=lambda: st.secrets,
                         salesperson=salesperson,
+                        sections_sink=_keep_sections,
                     )
                     progress.empty()
                     refreshed = backend.fetch_request(request_id)
@@ -786,16 +1000,70 @@ if task == "Trip Preference Parsing":
                         def _on_retry_progress(fraction, text):
                             bar.progress(fraction, text=text)
 
+                        def _keep_retry_sections(sections, _rid=row["id"]):
+                            st.session_state.setdefault("parsed_sections", {})[_rid] = sections
+
                         backend.run_parsing(
                             row["id"], row["onboarding_bytes"],
                             progress_callback=_on_retry_progress,
                             secrets_getter=lambda: st.secrets,
                             salesperson=row["salesperson"],
+                            sections_sink=_keep_retry_sections,
                         )
                         progress.empty()
                         st.rerun()
                 elif row["status"] == backend.STATUS_PROCESSING:
                     st.info("Still processing -- click Refresh above to check again.")
+
+    with tab_entry:
+        st.caption(
+            "The same parsed data, laid out in the destination's field order with its "
+            "own labels and normalized values — so it can be transcribed field by "
+            "field without re-deriving anything. The Excel export is unchanged and "
+            "still available under My Requests."
+        )
+
+        parsed = st.session_state.get("parsed_sections", {})
+        options = ["Upload an extraction file..."] + sorted(parsed, reverse=True)
+        picked = st.selectbox(
+            "Parsed document", options, key="entry_source",
+            help="Requests parsed in this browser session appear here.",
+        )
+
+        sections = None
+        if picked == "Upload an extraction file...":
+            if not parsed:
+                st.info(
+                    "No documents have been parsed in this browser session yet. Submit a "
+                    "request under 'Submit New Request', or upload an extraction file "
+                    "below.\n\n"
+                    "Raw extractions are held for the current session only — they are "
+                    "not saved to the database, so they do not survive a refresh or "
+                    "appear for requests parsed by someone else."
+                )
+            upload = st.file_uploader(
+                "Extraction file (.json)", type=["json"], key="entry_upload",
+                help="The cached extraction parsing_engine.py writes alongside a run.",
+            )
+            if upload is not None:
+                try:
+                    payload = json.loads(upload.getvalue().decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    st.error("That file could not be read as JSON.")
+                    payload = None
+                if payload is not None:
+                    sections = payload.get("sections") if isinstance(payload, dict) else None
+                    if not isinstance(sections, list):
+                        st.error(
+                            "That JSON has no 'sections' list, so it is not an extraction "
+                            "file from this engine."
+                        )
+                        sections = None
+        else:
+            sections = parsed.get(picked)
+
+        if sections:
+            render_entry_ready_view(sections, key_prefix=f"entry_{picked}")
 
 # ---------------------------------------------------------------------------
 # Flight Planning Parsing -- ON HOLD. Upload UI is live for later testing,
