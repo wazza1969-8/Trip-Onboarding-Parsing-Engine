@@ -17,7 +17,11 @@
  * page, clicks the wake-up button if the sleep screen is showing, waits
  * for the app to actually render inside that iframe, and stays connected
  * a few seconds so the visit counts as real traffic.
+ *
+ * On any non-success outcome it now saves diagnostics (screenshot + page
+ * text + frame list) so the workflow can upload them as an artifact.
  */
+const fs = require("fs");
 const { chromium } = require("playwright");
 
 // Can still be overridden by the APP_URL repo variable referenced in
@@ -31,6 +35,12 @@ const NAV_TIMEOUT = 90_000;
 const RESOLVE_TIMEOUT = 90_000; // wait for app-or-sleep-screen to appear
 const WAKE_TIMEOUT = 300_000; // cold boot (fresh container) can take minutes
 const DWELL_MS = 8_000; // stay connected so the session registers as traffic
+
+const WAKE_SELECTOR = [
+  '[data-testid="wakeup-button-viewer"]',
+  '[data-testid="wakeup-button-owner"]',
+  'button:has-text("get this app back up")',
+].join(", ");
 
 /** Cheap pre-check: this endpoint reaches the actual container, unlike the app root. */
 async function healthCheck(url) {
@@ -69,15 +79,32 @@ async function healthCheck(url) {
   }
 }
 
-/** The Streamlit app itself lives in the /~/+/ iframe. */
-function appFrame(page) {
-  return page.frames().find((f) => f.url().includes("/~/+/"));
+/** True if a Streamlit app container is rendered in ANY frame (main page included). */
+async function appRendered(page) {
+  for (const f of page.frames()) {
+    try {
+      if ((await f.locator('[data-testid="stApp"], .stApp').count()) > 0) return true;
+    } catch {
+      // frame may be navigating/detached; ignore and keep checking
+    }
+  }
+  return false;
 }
 
-async function appRendered(page) {
-  const f = appFrame(page);
-  if (!f) return false;
-  return (await f.locator('[data-testid="stApp"], .stApp').count()) > 0;
+/** Save what the headless browser actually saw, for the workflow to upload. */
+async function dumpDiagnostics(page, say, label) {
+  try {
+    say(`[${label}] title="${await page.title().catch(() => "?")}"`);
+    say(`[${label}] url: ${page.url()}`);
+    for (const f of page.frames()) say(`[${label}] frame: ${f.url()}`);
+    await page.screenshot({ path: "unresolved.png", fullPage: true }).catch(() => {});
+    const body = await page.innerText("body").catch(() => "");
+    fs.writeFileSync("unresolved.txt", `label: ${label}\nurl: ${page.url()}\n\n${body}`);
+    fs.writeFileSync("unresolved.html", await page.content().catch(() => ""));
+    say(`[${label}] body: ${body.slice(0, 300).replace(/\s+/g, " ")}`);
+  } catch (e) {
+    say(`diagnostics failed: ${e.message.split("\n")[0]}`);
+  }
 }
 
 async function visit(browser, url) {
@@ -92,11 +119,9 @@ async function visit(browser, url) {
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
 
-    const wakeBtn = page.locator(
-      '[data-testid="wakeup-button-viewer"], [data-testid="wakeup-button-owner"]'
-    );
+    const wakeBtn = page.locator(WAKE_SELECTOR);
 
-    // Race: either the app iframe renders, or the sleep screen appears.
+    // Race: either the app renders, or the sleep screen appears.
     const deadline = Date.now() + RESOLVE_TIMEOUT;
     let state = "unresolved";
     while (Date.now() < deadline) {
@@ -125,6 +150,7 @@ async function visit(browser, url) {
         await page.waitForTimeout(2000);
       }
       say("wake timed out");
+      await dumpDiagnostics(page, say, "WAKE_TIMEOUT");
       return "WAKE_TIMEOUT";
     }
 
@@ -135,9 +161,11 @@ async function visit(browser, url) {
     }
 
     say(`UNRESOLVED -- title="${await page.title()}"`);
+    await dumpDiagnostics(page, say, "UNRESOLVED");
     return "UNRESOLVED";
   } catch (e) {
     say(`ERROR: ${e.message.split("\n")[0]}`);
+    await dumpDiagnostics(page, say, "ERROR");
     return "ERROR";
   } finally {
     await ctx.close().catch(() => {});
@@ -161,7 +189,6 @@ async function visit(browser, url) {
   console.log(`\n=== RESULT: ${status} ===`);
 
   if (process.env.GITHUB_STEP_SUMMARY) {
-    const fs = require("fs");
     const icon = { AWAKE: "✅", WOKEN: "🔄", WAKE_TIMEOUT: "⚠️", UNRESOLVED: "⚠️", ERROR: "❌" };
     fs.appendFileSync(
       process.env.GITHUB_STEP_SUMMARY,
