@@ -39,11 +39,26 @@ jobs:
       - name: Visit app (wake if asleep)
         run: node keepalive.js
 
+      # If the visit fails, keep what the headless browser saw (screenshot,
+      # page text, raw HTML) so the cause can be read instead of guessed.
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-debug
+          path: |
+            unresolved.png
+            unresolved.txt
+            unresolved.html
+          if-no-files-found: ignore
+
       # GitHub disables scheduled workflows in repos with no commit
       # activity for 60 days -- silently. This heartbeat commit keeps the
       # schedule alive indefinitely, in case there's ever a long stretch
-      # with no other pushes to this repo.
+      # with no other pushes to this repo. It runs even when the visit
+      # step fails, so a failing keep-alive can't also let the schedule lapse.
       - name: Heartbeat commit
+        if: ${{ !cancelled() }}
         run: |
           date -u +"%Y-%m-%dT%H:%M:%SZ" > .last-keepalive-run
           if [[ -n "$(git status --porcelain .last-keepalive-run)" ]]; then
