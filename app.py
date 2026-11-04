@@ -360,27 +360,27 @@ st.markdown(
         border: 1px solid rgba(255,255,255,0.15);
         border-radius: 10px;
     }}
-        input, textarea, [data-baseweb="select"] > div {{
+    input, textarea, [data-baseweb="select"] > div {{
         background-color: rgba(255,255,255,0.92) !important;
         border-radius: 6px !important;
     }}
-    /* Dark text on the light input backgrounds above. Applied to
-       DESCENDANTS, not just the direct child, because the broad
+    /* Dark text on the LIGHT input backgrounds set above. Applied to
+       descendants, not just the direct child, because the broad
        `div {{ color: #eaf3f6 }}` rule earlier in this stylesheet paints
        every div near-white -- and a select's chosen value sits in a div
        nested several levels inside the component, so it rendered white
        on white. How deeply Streamlit nests that value changes between
-       versions, so this must not depend on it. The popover/listbox
-       selectors cover the open dropdown, which renders outside the
-       select element entirely. */
+       Streamlit versions, so this must not depend on it.
+
+       Deliberately scoped to the CLOSED control only. The open dropdown
+       is rendered by React outside this element, onto the dark panel
+       from .streamlit/config.toml (secondaryBackgroundColor #123244),
+       where the theme's own light text is already correct. Forcing dark
+       text there makes the options invisible. */
     input, textarea,
     [data-baseweb="select"] > div,
     [data-baseweb="select"] > div div,
-    [data-baseweb="select"] > div span,
-    [data-baseweb="popover"] div,
-    [data-baseweb="popover"] span,
-    [role="listbox"] div,
-    [role="option"] {{
+    [data-baseweb="select"] > div span {{
         color: #0b1c26 !important;
     }}
     [data-testid="stFileUploaderDropzone"] {{
