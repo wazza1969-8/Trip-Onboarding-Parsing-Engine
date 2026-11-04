@@ -1098,13 +1098,15 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
     intake form's Salesperson dropdown -- passed through to General
     Info's "Jeppesen FF Account Exec" line instead of a placeholder.
 
-    sections_sink(sections: list[dict]), if given, is handed the raw
-    extraction -- the same list that feeds map_to_subjects() -- before
-    the workbook is written. The entry-ready view needs field-level
-    label/value pairs, which the .xlsx (21 rows of composed prose) can no
-    longer provide once written. This is a pass-through only: nothing
-    here stores the raw extraction, and the caller decides its lifetime.
-    See the approval request in the delivery notes about persisting it."""
+    sections_sink(sections, by_subject), if given, is handed both the raw
+    extraction and the mapped {subject: [blocks]} that the workbook is
+    about to be written from, just before it is written. The entry-ready
+    view shows the mapped blocks (the Comments column, verbatim) and
+    falls back on the raw sections for its field-level checks; handing
+    over both means that view can never drift from the .xlsx, because it
+    is displaying the same object. This is a pass-through only: nothing
+    here stores either one, and the caller decides their lifetime. See
+    the approval request in the delivery notes about persisting them."""
     try:
         client, model = get_anthropic_client(secrets_getter)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1130,16 +1132,6 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
                     section["page"] = i
                     sections.append(section)
 
-            if sections_sink is not None:
-                # Handed over before mapping so the sink sees exactly what
-                # the engine saw, un-formatted. Failures here must never
-                # cost the user their parse, so they are swallowed -- the
-                # workbook is the deliverable, the entry-ready view is not.
-                try:
-                    sections_sink(sections)
-                except Exception:
-                    pass
-
             # Both of these come from the intake form, not the PDF. The
             # account number is read back off the stored request rather
             # than passed in, so a retry picks up the same value without
@@ -1154,6 +1146,20 @@ def run_parsing(request_id: str, pdf_bytes: bytes, progress_callback=None, secre
                 sections, salesperson=salesperson,
                 jeppesen_acct_nbr=acct_nbr, as_of=as_of,
             )
+
+            if sections_sink is not None:
+                # Handed over after mapping and before the write, so the
+                # sink gets the exact object the workbook is built from
+                # rather than something recomputed later from different
+                # inputs (a different salesperson, a date that has rolled
+                # over). Failures here must never cost the user their
+                # parse, so they are swallowed -- the workbook is the
+                # deliverable, the entry-ready view is not.
+                try:
+                    sections_sink(sections, by_subject)
+                except Exception:
+                    pass
+
             pe.write_workbook(by_subject, out_path)
             result_bytes = out_path.read_bytes()
 

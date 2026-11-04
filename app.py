@@ -61,6 +61,12 @@ import uuid
 import streamlit as st
 
 import backend
+# Not a new dependency: backend.py already imports this module, so if it
+# were missing the app would not have got this far. Imported here by
+# name anyway rather than reached for as backend.pe, so the Entry-Ready
+# View's use of SUBJECTS / map_to_subjects is visible at the top of the
+# file instead of hidden inside another module's namespace.
+import parsing_engine as pe
 
 # True only when the process was launched by pytest -- which is how the
 # UI tests in test_weekly_report.py drive this file via AppTest. This
@@ -194,19 +200,91 @@ def render_editable_report_form(submitter: str, period_id: str, key_prefix: str)
             st.error(str(e))
 
 
-def render_entry_ready_view(sections: list[dict], key_prefix: str) -> None:
-    """Renders one parsed document in the destination's field order.
+def render_entry_ready_view(by_subject: dict[str, list[str]], sections: list[dict],
+                            key_prefix: str) -> None:
+    """Renders one parsed document as the finished Operational
+    Information rows -- one copy-paste block per Subject.
 
-    Read-only by design: this view exists so a person can transcribe
+    The block shown for each Subject is `"\\n\\n".join(blocks)`, which is
+    character-for-character what write_workbook() puts in that row's
+    Comments cell. That is the point of this view: the earlier version
+    listed the destination manifest's individual fields, so a Subject
+    that reads as one composed paragraph in the workbook came out here
+    as a dozen one-word answers that somebody then had to reassemble by
+    hand. Re-deriving the prose in the UI would have been the same work
+    done twice in two places, free to drift apart; instead backend.py
+    hands the mapped dict straight over and this function only joins and
+    displays it.
+
+    Read-only by design. This view exists so a person can copy
     accurately, so it must never be the place a value gets quietly
-    changed. Everything it shows is either a normalized value or a flag
-    saying why a value could not be normalized -- and the original
-    extracted text is always one click away underneath, so a reviewer
-    can check the engine's reading without reopening the PDF.
+    changed.
+
+    The field-level checks are still available underneath, collapsed --
+    they are what flags an unresolved critical field, which the composed
+    blocks cannot show on their own."""
+    blocks_by_subject = {s: (by_subject.get(s) or []) for s in pe.SUBJECTS}
+    filled = [s for s in pe.SUBJECTS if blocks_by_subject[s]]
+
+    if not filled:
+        st.warning(
+            "Nothing mapped to any Subject for this document. That normally means "
+            "the source PDF is not a Trip Support Service Preferences form, or its "
+            "headings did not match. The Excel export will be empty too."
+        )
+        return
+
+    st.caption(
+        f"{len(filled)} of {len(pe.SUBJECTS)} subjects have content. Each block below "
+        "is exactly what the Excel export puts in that row's Comments cell — use the "
+        "copy button in the top-right corner of a block rather than selecting the text."
+    )
+
+    show_empty = st.checkbox(
+        "Show subjects with nothing extracted", value=False,
+        key=f"{key_prefix}_show_empty",
+        help="Off by default so the list matches what you actually have to paste.",
+    )
+    subjects = list(pe.SUBJECTS) if show_empty else filled
+
+    for subject in subjects:
+        st.markdown(f"##### {subject}")
+        comments = "\n\n".join(blocks_by_subject[subject])
+        if comments:
+            st.code(comments, language=None)
+        else:
+            st.caption(
+                "Nothing was extracted for this subject — it is an empty row in the "
+                "workbook too. Left blank rather than guessed."
+            )
+
+    st.divider()
+    # A checkbox rather than an expander: render_field_level_checks()
+    # puts every field's provenance in its own expander, and Streamlit
+    # refuses to nest one expander inside another.
+    if st.checkbox(
+        "Show field-by-field checks", value=False, key=f"{key_prefix}_show_checks",
+        help="Validation only — nothing in here needs to be copied.",
+    ):
+        st.caption(
+            "The same data broken back down into individual fields, each checked "
+            "against a destination's field specification. This is for spotting a "
+            "value the engine could not normalize — particularly a critical one — "
+            "before you paste the blocks above."
+        )
+        render_field_level_checks(sections, key_prefix)
+
+
+def render_field_level_checks(sections: list[dict], key_prefix: str) -> None:
+    """Field-level validation of one parsed document against a
+    destination manifest. Everything it shows is either a normalized
+    value or a flag saying why a value could not be normalized -- and
+    the original extracted text is always one click away underneath, so
+    a reviewer can check the engine's reading without reopening the PDF.
 
     Imported lazily so app.py still starts if entry_ready.py /
     field_manifest.py / the manifests folder haven't been deployed --
-    only this tab breaks, rather than the whole app."""
+    only this section breaks, rather than the whole app."""
     try:
         import entry_ready as er
         import field_manifest as fm
@@ -934,14 +1012,17 @@ if task == "Trip Preference Parsing":
                     def _on_progress(fraction, text):
                         bar.progress(fraction, text=text)
 
-                    # Keep the raw extraction for this browser session only,
-                    # so the Entry-Ready View has field-level label/value
-                    # pairs to work from. It is NOT written to the database
-                    # -- persisting it would need a schema change and a
-                    # deliberate decision, since the extraction contains
-                    # customer PII in structured, queryable form.
-                    def _keep_sections(sections, _rid=request_id):
-                        st.session_state.setdefault("parsed_sections", {})[_rid] = sections
+                    # Keep the mapped subjects (what the Entry-Ready View
+                    # displays) and the raw extraction (what its
+                    # field-by-field checks work from) for this browser
+                    # session only. Neither is written to the database --
+                    # persisting them would need a schema change and a
+                    # deliberate decision, since both contain customer PII
+                    # in structured, queryable form.
+                    def _keep_sections(sections, by_subject, _rid=request_id):
+                        st.session_state.setdefault("parsed_sections", {})[_rid] = {
+                            "sections": sections, "by_subject": by_subject,
+                        }
 
                     backend.run_parsing(
                         request_id, onboarding_bytes,
@@ -1000,8 +1081,10 @@ if task == "Trip Preference Parsing":
                         def _on_retry_progress(fraction, text):
                             bar.progress(fraction, text=text)
 
-                        def _keep_retry_sections(sections, _rid=row["id"]):
-                            st.session_state.setdefault("parsed_sections", {})[_rid] = sections
+                        def _keep_retry_sections(sections, by_subject, _rid=row["id"]):
+                            st.session_state.setdefault("parsed_sections", {})[_rid] = {
+                                "sections": sections, "by_subject": by_subject,
+                            }
 
                         backend.run_parsing(
                             row["id"], row["onboarding_bytes"],
@@ -1017,10 +1100,10 @@ if task == "Trip Preference Parsing":
 
     with tab_entry:
         st.caption(
-            "The same parsed data, laid out in the destination's field order with its "
-            "own labels and normalized values — so it can be transcribed field by "
-            "field without re-deriving anything. The Excel export is unchanged and "
-            "still available under My Requests."
+            "The finished Operational Information rows on screen, one copy-paste "
+            "block per Subject — the same text the Excel export puts in that row's "
+            "Comments cell, so nothing has to be retyped or reassembled. The Excel "
+            "export is unchanged and still available under My Requests."
         )
 
         parsed = st.session_state.get("parsed_sections", {})
@@ -1031,6 +1114,7 @@ if task == "Trip Preference Parsing":
         )
 
         sections = None
+        by_subject = None
         if picked == "Upload an extraction file...":
             if not parsed:
                 st.info(
@@ -1059,11 +1143,29 @@ if task == "Trip Preference Parsing":
                             "file from this engine."
                         )
                         sections = None
+                    else:
+                        # An extraction file holds only what came out of the
+                        # PDF. The account number, the salesperson and the
+                        # High Profile Notes date come from the intake form,
+                        # so a document loaded this way shows the engine's
+                        # placeholders for them. Said plainly rather than
+                        # silently, because those three are the lines
+                        # someone would most likely paste without checking.
+                        by_subject = pe.map_to_subjects(sections)
+                        st.info(
+                            "Loaded from a file, so the Jeppesen account number, the "
+                            "account exec name and the High Profile Notes month come "
+                            "out as placeholders — those three come from the intake "
+                            "form, not the PDF. Pick the request from the dropdown "
+                            "above instead to see the real values."
+                        )
         else:
-            sections = parsed.get(picked)
+            stored = parsed.get(picked) or {}
+            sections = stored.get("sections")
+            by_subject = stored.get("by_subject")
 
-        if sections:
-            render_entry_ready_view(sections, key_prefix=f"entry_{picked}")
+        if by_subject is not None:
+            render_entry_ready_view(by_subject, sections or [], key_prefix=f"entry_{picked}")
 
 # ---------------------------------------------------------------------------
 # Flight Planning Parsing -- ON HOLD. Upload UI is live for later testing,
