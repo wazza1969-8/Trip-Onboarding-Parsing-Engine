@@ -54,6 +54,7 @@ Deploying for a few users
 """
 
 import hmac
+import io
 import json
 import os
 import uuid
@@ -200,6 +201,66 @@ def render_editable_report_form(submitter: str, period_id: str, key_prefix: str)
             st.error(str(e))
 
 
+EXPORT_SHEET_NAME = "Operational Information"
+
+
+def by_subject_from_workbook(data: bytes) -> tuple[dict[str, list[str]] | None, str | None]:
+    """Reads the Excel file this app exports (write_workbook in
+    parsing_engine.py) back into the {subject: [comment text]} shape the
+    Entry-Ready View renders.
+
+    The export is a sheet of Subject / Comments rows, and each Comments
+    cell is exactly "\\n\\n".join(blocks) for that Subject -- the same string
+    the view joins and shows. So nothing needs re-deriving: the cell text
+    goes back in as a single block and displays character-for-character
+    as exported. Because the file was written after the request's own
+    account number, account exec name and High Profile Notes month were
+    filled in, those come through as real values -- unlike a raw .json
+    extraction, which only has what was in the PDF.
+
+    Returns (by_subject, None) on success or (None, message) on failure.
+    Read-only: nothing is written anywhere. Extra columns, extra sheets
+    and blank rows are tolerated; Subjects this engine does not know are
+    ignored rather than shown."""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data), data_only=True)
+    except Exception:
+        return None, "That file could not be read as an Excel workbook (.xlsx)."
+
+    ws = wb[EXPORT_SHEET_NAME] if EXPORT_SHEET_NAME in wb.sheetnames else wb.active
+
+    header = [str(c.value or "").strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1), [])]
+    if "subject" not in header or "comments" not in header:
+        return None, (
+            "That workbook does not have 'Subject' and 'Comments' columns in its first "
+            "row, so it is not an Operational Information export from this tool."
+        )
+    subj_col, comm_col = header.index("subject"), header.index("comments")
+
+    known = {s.lower(): s for s in pe.SUBJECTS}
+    by_subject: dict[str, list[str]] = {s: [] for s in pe.SUBJECTS}
+    matched = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if subj_col >= len(row):
+            continue
+        name = str(row[subj_col] or "").strip()
+        subject = known.get(name.lower())
+        if subject is None:
+            continue
+        matched += 1
+        comments = str(row[comm_col] if comm_col < len(row) and row[comm_col] is not None else "").strip()
+        if comments:
+            by_subject[subject].append(comments)
+
+    if matched == 0:
+        return None, (
+            "None of the Subject names in that workbook match this tool's Operational "
+            "Information subjects, so it is not an export from this tool."
+        )
+    return by_subject, None
+
+
 def render_entry_ready_view(by_subject: dict[str, list[str]], sections: list[dict],
                             key_prefix: str) -> None:
     """Renders one parsed document as the finished Operational
@@ -259,6 +320,15 @@ def render_entry_ready_view(by_subject: dict[str, list[str]], sections: list[dic
             )
 
     st.divider()
+    if not sections:
+        # Loaded from the Excel export: it holds the finished text, not the
+        # raw extraction the field checks work from.
+        st.caption(
+            "Field-by-field checks need the raw extraction, which an Excel file does "
+            "not contain. They are available for a request parsed in this browser "
+            "session."
+        )
+        return
     # A checkbox rather than an expander: render_field_level_checks()
     # puts every field's provenance in its own expander, and Streamlit
     # refuses to nest one expander inside another.
@@ -1110,7 +1180,9 @@ if task == "Trip Preference Parsing":
         options = ["Upload an extraction file..."] + sorted(parsed, reverse=True)
         picked = st.selectbox(
             "Parsed document", options, key="entry_source",
-            help="Requests parsed in this browser session appear here.",
+            help="Requests parsed in this browser session appear here. To come back to an "
+                 "earlier request, choose 'Upload an extraction file...' and upload its "
+                 "Excel export.",
         )
 
         sections = None
@@ -1119,17 +1191,31 @@ if task == "Trip Preference Parsing":
             if not parsed:
                 st.info(
                     "No documents have been parsed in this browser session yet. Submit a "
-                    "request under 'Submit New Request', or upload an extraction file "
-                    "below.\n\n"
-                    "Raw extractions are held for the current session only — they are "
-                    "not saved to the database, so they do not survive a refresh or "
-                    "appear for requests parsed by someone else."
+                    "request under 'Submit New Request', or upload the Excel file from a "
+                    "previous parse below (download it from 'My Requests').\n\n"
+                    "Parsed requests are held for the current session only — they do not "
+                    "survive a refresh or appear for requests parsed by someone else. "
+                    "The Excel export is how you come back to one later."
                 )
             upload = st.file_uploader(
-                "Extraction file (.json)", type=["json"], key="entry_upload",
-                help="The cached extraction parsing_engine.py writes alongside a run.",
+                "Excel export (.xlsx) or extraction file (.json)",
+                type=["xlsx", "json"], key="entry_upload",
+                help="Upload the Operational Information Excel file this tool exported "
+                     "(from 'My Requests'). A .json extraction file is also accepted.",
             )
-            if upload is not None:
+            if upload is not None and upload.name.lower().endswith(".xlsx"):
+                by_subject, xlsx_error = by_subject_from_workbook(upload.getvalue())
+                if xlsx_error:
+                    st.error(xlsx_error)
+                    by_subject = None
+                else:
+                    sections = []
+                    st.success(
+                        "Loaded from the Excel export. The blocks below are the exported "
+                        "text exactly as it was saved, including the account number, "
+                        "account exec name and High Profile Notes month."
+                    )
+            elif upload is not None:
                 try:
                     payload = json.loads(upload.getvalue().decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
