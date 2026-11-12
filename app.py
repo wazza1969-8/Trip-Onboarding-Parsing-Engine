@@ -1177,25 +1177,37 @@ if task == "Trip Preference Parsing":
         )
 
         parsed = st.session_state.get("parsed_sections", {})
-        options = ["Upload an extraction file..."] + sorted(parsed, reverse=True)
+
+        # Completed requests already saved in the database. The finished Excel
+        # for each one is stored with the request (it is what the Download
+        # button under My Requests serves), so the Entry-Ready View can be
+        # rebuilt from it at any time -- nothing new is stored. `rows` is the
+        # list the My Requests tab loaded earlier in this same run. A request
+        # parsed in this browser session is left out of this list because it
+        # is already offered above with its full field-level checks.
+        saved = {}
+        for _row in rows:
+            if (_row["status"] == backend.STATUS_COMPLETE and _row["result_bytes"]
+                    and _row["id"] not in parsed):
+                saved[f"{_row['id']} -- {_row['salesperson']} ({_row['created_at']})"] = _row
+
+        options = (["Upload an extraction file..."]
+                   + sorted(parsed, reverse=True)
+                   + list(saved))
         picked = st.selectbox(
             "Parsed document", options, key="entry_source",
-            help="Requests parsed in this browser session appear here. To come back to an "
-                 "earlier request, choose 'Upload an extraction file...' and upload its "
-                 "Excel export.",
+            help="Any completed request appears here, so you can come back to it later. "
+                 "You can also choose 'Upload an extraction file...' to load an Excel "
+                 "export from a file.",
         )
 
         sections = None
         by_subject = None
         if picked == "Upload an extraction file...":
-            if not parsed:
+            if not parsed and not saved:
                 st.info(
-                    "No documents have been parsed in this browser session yet. Submit a "
-                    "request under 'Submit New Request', or upload the Excel file from a "
-                    "previous parse below (download it from 'My Requests').\n\n"
-                    "Parsed requests are held for the current session only — they do not "
-                    "survive a refresh or appear for requests parsed by someone else. "
-                    "The Excel export is how you come back to one later."
+                    "No completed requests yet. Submit a request under 'Submit New "
+                    "Request', or upload an Excel export from a previous parse below."
                 )
             upload = st.file_uploader(
                 "Excel export (.xlsx) or extraction file (.json)",
@@ -1245,6 +1257,17 @@ if task == "Trip Preference Parsing":
                             "form, not the PDF. Pick the request from the dropdown "
                             "above instead to see the real values."
                         )
+        elif picked in saved:
+            by_subject, saved_error = by_subject_from_workbook(bytes(saved[picked]["result_bytes"]))
+            if saved_error:
+                st.error(saved_error)
+                by_subject = None
+            else:
+                sections = []
+                st.caption(
+                    "Loaded from the saved Excel export for this request, exactly as "
+                    "it appears under 'My Requests'."
+                )
         else:
             stored = parsed.get(picked) or {}
             sections = stored.get("sections")
