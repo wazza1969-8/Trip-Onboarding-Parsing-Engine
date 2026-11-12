@@ -261,6 +261,26 @@ def by_subject_from_workbook(data: bytes) -> tuple[dict[str, list[str]] | None, 
     return by_subject, None
 
 
+def customer_name_from_by_subject(by_subject: dict[str, list[str]] | None) -> str:
+    """The customer's name as the parser extracted it: the 'Company Name:'
+    line the engine writes into the Company Details block. Returns '' when
+    the document had none, so the caller can leave the label as it was
+    rather than show a made-up name."""
+    for block in (by_subject or {}).get("Company Details", []) or []:
+        for line in str(block).splitlines():
+            if line.strip().lower().startswith("company name:"):
+                return line.split(":", 1)[1].strip()
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def customer_name_from_workbook(data: bytes) -> str:
+    """Same lookup for a saved Excel export. Cached by file content, so the
+    dropdown does not reopen every saved workbook on each page refresh."""
+    by_subject, error = by_subject_from_workbook(data)
+    return "" if error else customer_name_from_by_subject(by_subject)
+
+
 def render_entry_ready_view(by_subject: dict[str, list[str]], sections: list[dict],
                             key_prefix: str) -> None:
     """Renders one parsed document as the finished Operational
@@ -1189,13 +1209,31 @@ if task == "Trip Preference Parsing":
         for _row in rows:
             if (_row["status"] == backend.STATUS_COMPLETE and _row["result_bytes"]
                     and _row["id"] not in parsed):
-                saved[f"{_row['id']} -- {_row['salesperson']} ({_row['created_at']})"] = _row
+                saved[_row["id"]] = _row
 
         options = (["Upload an extraction file..."]
                    + sorted(parsed, reverse=True)
                    + list(saved))
+
+        def _document_label(option: str) -> str:
+            """What the dropdown shows. The option value stays the request
+            id; only the text on screen changes. The customer's name, as
+            parsed from the document, comes first; if the document had no
+            Company Name the label is just what it was before."""
+            if option in saved:
+                row = saved[option]
+                name = customer_name_from_workbook(bytes(row["result_bytes"]))
+                label = f"{option} -- {row['salesperson']} ({row['created_at']})"
+            elif option in parsed:
+                name = customer_name_from_by_subject((parsed[option] or {}).get("by_subject"))
+                label = option
+            else:
+                return option
+            return f"{name} -- {label}" if name else label
+
         picked = st.selectbox(
             "Parsed document", options, key="entry_source",
+            format_func=_document_label,
             help="Any completed request appears here, so you can come back to it later. "
                  "You can also choose 'Upload an extraction file...' to load an Excel "
                  "export from a file.",
