@@ -45,14 +45,39 @@ already private to one browser session/user, with an explicit
 "Refresh" control.
 """
 import hashlib
+import io
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image
 
 import documents_repo
 
 PAGE_SIZE = 25
+
+# Preview (Phase 5): on-demand only, through download_version() so the
+# same authorization/archived-status/audit rules as any other download
+# apply. Only these mime types get a Preview button at all; anything
+# else is download-only.
+#
+# PDF is deliberately NOT included here: st.pdf exists on the pinned
+# streamlit==1.66.1, but calling it raises StreamlitAPIException unless
+# the optional `streamlit-pdf` package (the `streamlit[pdf]` extra) is
+# also installed -- confirmed by actually calling it, not just checking
+# hasattr(st, "pdf"). That is a requirements.txt change, which Phase 5's
+# instructions say to stop and ask about rather than make unilaterally.
+_PREVIEWABLE_MIME_TYPES = {"image/png", "image/jpeg"}
+PREVIEW_MAX_BYTES = 10 * 1024 * 1024
+
+# A pixel-dimension cap for image previews, independent of the byte-size
+# cap above -- a small file can still claim enormous width*height in its
+# header (a classic "decompression bomb" shape), which would blow up
+# memory/CPU if actually decoded. Image.open() only reads the header to
+# get .size, so checking this never fully decodes the image -- Pillow
+# is already a hard streamlit dependency (streamlit[auth]==1.66.1 pulls
+# it in for st.image itself), not a new one added here.
+PREVIEW_MAX_PIXELS = 25_000_000
 
 # Rank order for comparing a get_access_level() result against a
 # minimum level -- "admin" always passes regardless of position here.
@@ -357,10 +382,9 @@ def _render_category_list(actor_email: str, categories: list[dict], secrets_gett
         counts: dict[int, int] = {}
         for cat in categories:
             try:
-                rows = documents_repo.list_documents(
-                    actor_email, category_id=cat["id"], page_size=10_000, secrets_getter=secrets_getter,
+                counts[cat["id"]] = documents_repo.count_documents(
+                    actor_email, category_id=cat["id"], secrets_getter=secrets_getter,
                 )
-                counts[cat["id"]] = len(rows)
             except Exception:
                 counts[cat["id"]] = 0
         st.session_state[counts_key] = counts
@@ -447,6 +471,20 @@ def _render_filters_and_table(actor_email: str, selected_category: int | None, s
             st.info("No documents yet.")
         return [], filters_active
 
+    try:
+        total_count = documents_repo.count_documents(
+            actor_email,
+            category_id=selected_category,
+            search=search or None,
+            file_type=file_type_value,
+            date_from=date_from_value,
+            date_to=date_to_value,
+            status=status_filter,
+            secrets_getter=secrets_getter,
+        )
+    except Exception:
+        total_count = None
+
     table_rows = [
         {
             "Title": d["title"],
@@ -468,7 +506,11 @@ def _render_filters_and_table(actor_email: str, selected_category: int | None, s
             st.session_state["doc_repo_page"] = page - 1
             st.rerun()
     with col_label:
-        st.caption(f"Page {page}")
+        if total_count is not None:
+            start = (page - 1) * PAGE_SIZE + 1
+            st.caption(f"Showing {start}-{start + len(docs) - 1} of {total_count}")
+        else:
+            st.caption(f"Page {page}")
     with col_next:
         if st.button("Next ▶", key="doc_repo_next_btn", disabled=(len(docs) < PAGE_SIZE)):
             st.session_state["doc_repo_page"] = page + 1
@@ -544,6 +586,65 @@ def _render_detail_panel(actor_email: str, docs: list[dict], categories_by_id: d
             )
         if not can_contribute and len(versions) > 1:
             st.caption(f"{len(versions) - 1} earlier version(s) -- visible to administrators and contributors only.")
+
+        current_version = next((v for v in versions if v["id"] == detail.get("current_version_id")), None)
+        if current_version is not None and current_version.get("mime_type") in _PREVIEWABLE_MIME_TYPES:
+            if (current_version.get("size_bytes") or 0) > PREVIEW_MAX_BYTES:
+                st.caption(
+                    f"This file is over {_human_size(PREVIEW_MAX_BYTES)} -- "
+                    "use the download option below instead of previewing it."
+                )
+            else:
+                preview_key = f"_doc_repo_preview::{selected_doc_id}"
+                if st.button("Preview", key=f"doc_repo_preview_btn::{selected_doc_id}"):
+                    try:
+                        with st.spinner("Loading preview..."):
+                            filename, mime_type, data = documents_repo.download_version(
+                                actor_email, selected_doc_id, secrets_getter=secrets_getter,
+                            )
+                        # Keep at most one previewed image in memory at
+                        # a time -- without this, switching between
+                        # documents and previewing each would pile up
+                        # one full set of decoded bytes per document
+                        # for the rest of the session.
+                        for stale_key in [k for k in st.session_state if k.startswith("_doc_repo_preview::") and k != preview_key]:
+                            del st.session_state[stale_key]
+                        st.session_state[preview_key] = (filename, mime_type, data)
+                    except documents_repo.PermissionDenied as e:
+                        st.error(_escape_markdown(str(e)))
+                    except documents_repo.StorageIntegrityError:
+                        st.error(
+                            "This file's stored copy failed an integrity check and can't be "
+                            "previewed. Contact an administrator."
+                        )
+                    except Exception:
+                        st.error("Couldn't load a preview right now.")
+
+                if preview_key in st.session_state:
+                    _, preview_mime_type, preview_data = st.session_state[preview_key]
+                    if preview_mime_type in ("image/png", "image/jpeg"):
+                        try:
+                            # Image.open() is lazy -- it reads only
+                            # enough of the header to report .size,
+                            # never decodes pixel data -- so this check
+                            # never fully decodes an image just to
+                            # measure it, even a malicious one.
+                            with Image.open(io.BytesIO(preview_data)) as probe:
+                                width, height = probe.size
+                            within_pixel_limit = (width * height) <= PREVIEW_MAX_PIXELS
+                        except Exception:
+                            within_pixel_limit = False
+
+                        if not within_pixel_limit:
+                            st.info(
+                                "This image's dimensions are too large to preview safely -- "
+                                "use the download option below instead."
+                            )
+                        else:
+                            try:
+                                st.image(preview_data)
+                            except Exception:
+                                st.error("Couldn't render a preview of this file. Try downloading it instead.")
 
         prepare_key = f"_doc_repo_prepared::{selected_doc_id}"
         if st.button("Prepare download", key=f"doc_repo_prepare_btn::{selected_doc_id}"):
@@ -831,17 +932,30 @@ def _run_admin_action(action, *args, success_message: str = "Done.", **kwargs) -
 
 
 def _render_admin_tab(actor_email: str, secrets_getter) -> None:
+    # Only the selected section is rendered -- unlike a plain st.tabs()
+    # (which renders every tab's content on every rerun, just hiding the
+    # inactive ones with CSS), a segmented_control lets us skip the other
+    # four sections' DB round trips entirely until the admin asks for them.
     sub_names = ["Categories", "Users & Roles", "Access Grants", "Archived Records", "Audit Log"]
-    subs = dict(zip(sub_names, st.tabs(sub_names)))
-    with subs["Categories"]:
+    selected = st.segmented_control(
+        "Admin section",
+        sub_names,
+        default=sub_names[0],
+        key="doc_repo_admin_section",
+        label_visibility="collapsed",
+    )
+    if selected is None:
+        selected = sub_names[0]
+
+    if selected == "Categories":
         _render_admin_categories(actor_email, secrets_getter)
-    with subs["Users & Roles"]:
+    elif selected == "Users & Roles":
         _render_admin_users(actor_email, secrets_getter)
-    with subs["Access Grants"]:
+    elif selected == "Access Grants":
         _render_admin_access_grants(actor_email, secrets_getter)
-    with subs["Archived Records"]:
+    elif selected == "Archived Records":
         _render_admin_archived_records(actor_email, secrets_getter)
-    with subs["Audit Log"]:
+    elif selected == "Audit Log":
         _render_admin_audit_log(actor_email, secrets_getter)
 
 
@@ -1125,6 +1239,13 @@ def _render_admin_archived_records(actor_email: str, secrets_getter) -> None:
         st.info("No archived documents.")
         return
 
+    try:
+        total_count = documents_repo.count_documents(
+            actor_email, status=documents_repo.STATUS_ARCHIVED, secrets_getter=secrets_getter,
+        )
+    except Exception:
+        total_count = None
+
     for d in docs:
         with st.container(border=True):
             category_name = categories_by_id.get(d["category_id"], {}).get("name", "—")
@@ -1145,7 +1266,11 @@ def _render_admin_archived_records(actor_email: str, secrets_getter) -> None:
             st.session_state["_doc_repo_admin_archived_page"] = page - 1
             st.rerun()
     with col_label:
-        st.caption(f"Page {page}")
+        if total_count is not None:
+            start = (page - 1) * PAGE_SIZE + 1
+            st.caption(f"Showing {start}-{start + len(docs) - 1} of {total_count}")
+        else:
+            st.caption(f"Page {page}")
     with col_next:
         if st.button("Next ▶", key="doc_repo_admin_archived_next_btn", disabled=(len(docs) < PAGE_SIZE)):
             st.session_state["_doc_repo_admin_archived_page"] = page + 1
@@ -1193,6 +1318,14 @@ def _render_admin_audit_log(actor_email: str, secrets_getter) -> None:
         st.info("No audit log entries match these filters.")
         return
 
+    try:
+        total_count = documents_repo.count_audit_log(
+            actor_email, actor_filter=actor_filter or None, action_filter=action_filter or None,
+            date_from=date_from_value, date_to=date_to_value, secrets_getter=secrets_getter,
+        )
+    except Exception:
+        total_count = None
+
     # st.dataframe cells are always plain text (confirmed: no Markdown
     # rendering there, unlike nearly everything else in this module) --
     # so, unlike elsewhere, these are deliberately NOT passed through
@@ -1217,7 +1350,11 @@ def _render_admin_audit_log(actor_email: str, secrets_getter) -> None:
             st.session_state["_doc_repo_admin_audit_page"] = page - 1
             st.rerun()
     with col_label:
-        st.caption(f"Page {page}")
+        if total_count is not None:
+            start = (page - 1) * PAGE_SIZE + 1
+            st.caption(f"Showing {start}-{start + len(rows) - 1} of {total_count}")
+        else:
+            st.caption(f"Page {page}")
     with col_next:
         if st.button("Next ▶", key="doc_repo_admin_audit_next_btn", disabled=(len(rows) < PAGE_SIZE)):
             st.session_state["_doc_repo_admin_audit_page"] = page + 1

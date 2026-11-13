@@ -69,9 +69,11 @@ real Okta/password gate. See app.py's own docstring for that flag.)
 """
 import io
 import sqlite3
+import struct
 import sys
 import unittest
 import zipfile
+import zlib
 from datetime import date
 from unittest import mock
 
@@ -97,6 +99,37 @@ def make_pdf(total_size=None):
     if total_size is None:
         return header
     return header + b"0" * (total_size - len(header))
+
+
+def make_png():
+    """A real, decodable 2x2 PNG -- not just magic bytes -- so tests
+    that click Preview actually exercise st.image() decoding the
+    bytes, not just that a button existed. Pillow is a hard streamlit
+    dependency (not something this adds), so it's always available
+    wherever these tests run."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color="red").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def make_oversized_png():
+    # Magic bytes only (no need to be a real decodable image): this is
+    # for the "too big to preview" path, which checks size and never
+    # calls st.image() at all.
+    return b"\x89PNG\r\n\x1a\n" + b"0" * (documents_ui.PREVIEW_MAX_BYTES + 1024)
+
+
+def make_png_with_huge_claimed_dimensions(width=40000, height=40000):
+    """A tiny, well-formed PNG (just IHDR + IEND, no pixel data) whose
+    header claims enormous dimensions -- a classic "decompression
+    bomb" shape. Small enough to sail under PREVIEW_MAX_BYTES, so this
+    exercises the pixel-count check, not the byte-size check."""
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    ihdr_chunk = struct.pack(">I", len(ihdr_data)) + b"IHDR" + ihdr_data + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr_data))
+    iend_chunk = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND"))
+    return sig + ihdr_chunk + iend_chunk
 
 
 def make_ooxml_zip(macro=False):
@@ -298,6 +331,15 @@ class DocumentRepositoryUITests(unittest.TestCase):
     @staticmethod
     def _select_document_repository(at):
         at.button(key="select_Document Repository").click().run(timeout=30)
+        return at
+
+    @staticmethod
+    def _select_admin_section(at, section_name):
+        """Admin sub-sections are lazy-loaded (Phase 5 performance change):
+        only the selected section's widgets exist on a given rerun, so
+        tests for any section other than the default ("Categories") must
+        switch to it first."""
+        at.segmented_control(key="doc_repo_admin_section").set_value(section_name).run(timeout=30)
         return at
 
     # -----------------------------------------------------------------
@@ -532,13 +574,43 @@ class DocumentRepositoryUITests(unittest.TestCase):
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
         self.assertFalse(at.exception)
-        # The Admin tab's own tables (e.g. the audit log) also render
-        # unconditionally for an admin -- not just the Browse tab's
-        # document table -- so this looks for the Browse table's
-        # content among whichever dataframes exist, rather than
-        # asserting there is exactly one on the whole page.
+        # Looks for the Browse table's content among whichever
+        # dataframes exist, rather than assuming there is exactly one
+        # on the whole page -- the Admin tab's default section
+        # ("Categories") has none, but this stays robust even if that
+        # default or a section's own rendering ever changes.
         all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
         self.assertIn("Blob Isolation Doc", all_titles)
+
+    def test_browse_pagination_shows_count_of_total(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Count Caption", secrets_getter=admin_secrets_getter)
+        for i in range(3):
+            documents_repo.add_document(
+                ADMIN_EMAIL, cat_id, f"Doc {i}", PDF_BYTES, f"doc_{i}.pdf",
+                secrets_getter=admin_secrets_getter,
+            )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("Showing 1-3 of 3", captions)
+
+    def test_browse_date_to_today_still_shows_a_document_uploaded_today(self):
+        # Regression test for the date_to off-by-one on created_at
+        # (same bug class as the Admin audit log's date_to): "Uploaded
+        # to" defaulting to today must not exclude a document created
+        # moments ago today.
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Date Filter UI", secrets_getter=admin_secrets_getter)
+        documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Uploaded Today", PDF_BYTES, "today.pdf",
+            secrets_getter=admin_secrets_getter,
+        )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.date_input(key="doc_repo_date_to").set_value(date.today()).run(timeout=30)
+        self.assertFalse(at.exception)
+        all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
+        self.assertIn("Uploaded Today", all_titles)
 
     def test_prepare_download_then_download_button_appears(self):
         cat_id = documents_repo.create_category(ADMIN_EMAIL, "Download Test", secrets_getter=admin_secrets_getter)
@@ -555,6 +627,117 @@ class DocumentRepositoryUITests(unittest.TestCase):
         at.button(key=f"doc_repo_prepare_btn::{doc_id}").click().run(timeout=30)
         self.assertFalse(at.exception)
         self.assertEqual(len(at.download_button), 1)
+
+    # -----------------------------------------------------------------
+    # Phase 5: on-demand Preview (goes through download_version(), so
+    # authorization/archived-status/audit all apply exactly like a
+    # real download)
+    # -----------------------------------------------------------------
+    def test_preview_button_renders_image_for_png(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Preview PNG", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Preview Doc", make_png(), "a.png",
+            secrets_getter=admin_secrets_getter,
+        )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.image), 0)  # not loaded before Preview is pressed
+
+        at.button(key=f"doc_repo_preview_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.image), 1)
+
+        # Preview goes through download_version() exactly like a real
+        # download -- so it's audited as one, not silently exempt.
+        rows = documents_repo.list_audit_log(ADMIN_EMAIL, action_filter="download_version", secrets_getter=admin_secrets_getter, page_size=10)
+        self.assertEqual(len(rows), 1)
+
+    def test_preview_denied_for_outsider_same_as_download(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Preview Denied", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Preview Doc", make_png(), "a.png",
+            secrets_getter=admin_secrets_getter,
+        )
+        with self.assertRaises(documents_repo.PermissionDenied):
+            documents_repo.download_version(OUTSIDER_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+
+    def test_no_preview_button_for_non_previewable_format(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Preview PDF", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "PDF Doc", PDF_BYTES, "a.pdf",
+            secrets_getter=admin_secrets_getter,
+        )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        preview_keys = [b.key for b in at.button if b.key and b.key.startswith("doc_repo_preview_btn::")]
+        self.assertEqual(preview_keys, [])
+        # PDFs are download-only this phase (st.pdf needs an extra
+        # package not in requirements.txt) -- "Prepare download" must
+        # still work normally.
+        self.assertEqual(len([b for b in at.button if b.key == f"doc_repo_prepare_btn::{doc_id}"]), 1)
+
+    def test_preview_shows_message_instead_of_button_when_over_size_limit(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Preview Oversized", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Huge Image", make_oversized_png(), "big.png",
+            secrets_getter=admin_secrets_getter,
+        )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        preview_keys = [b.key for b in at.button if b.key and b.key.startswith("doc_repo_preview_btn::")]
+        self.assertEqual(preview_keys, [])
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("use the download option below", captions)
+
+    def test_preview_rejects_image_with_huge_claimed_dimensions(self):
+        # A tiny file (well under PREVIEW_MAX_BYTES) whose PNG header
+        # claims 40000x40000 -- a decompression-bomb shape. Must not
+        # raise, must not render st.image, must show a friendly message
+        # instead of ever decoding the (claimed) 1.6 billion pixels.
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Preview Bomb", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Bomb Image", make_png_with_huge_claimed_dimensions(), "bomb.png",
+            secrets_getter=admin_secrets_getter,
+        )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+
+        at.button(key=f"doc_repo_preview_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.image), 0)
+        infos = " ".join(i.value for i in at.info)
+        self.assertIn("too large to preview safely", infos)
+
+    def test_previewing_a_second_document_evicts_the_first_from_cache(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Preview Cache", secrets_getter=admin_secrets_getter)
+        doc_a = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Doc A", make_png(), "a.png", secrets_getter=admin_secrets_getter,
+        )
+        doc_b = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Doc B", make_png(), "b.png", secrets_getter=admin_secrets_getter,
+        )
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_a).run(timeout=30)
+        at.button(key=f"doc_repo_preview_btn::{doc_a}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        preview_keys = [k for k in at.session_state if k.startswith("_doc_repo_preview::")]
+        self.assertEqual(preview_keys, [f"_doc_repo_preview::{doc_a}"])
+
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_b).run(timeout=30)
+        at.button(key=f"doc_repo_preview_btn::{doc_b}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        preview_keys = [k for k in at.session_state if k.startswith("_doc_repo_preview::")]
+        self.assertEqual(preview_keys, [f"_doc_repo_preview::{doc_b}"])
 
     # -----------------------------------------------------------------
     # Phase 3: Upload tab
@@ -971,8 +1154,12 @@ class DocumentRepositoryUITests(unittest.TestCase):
         self.assertFalse(at.exception)
         labels = [t.label for t in at.tabs]
         self.assertIn("Admin", labels)
+        # Sub-sections are a lazy-loaded segmented_control (Phase 5), not
+        # nested st.tabs() -- every option should still be offered, even
+        # though only one section's content renders at a time.
+        section_options = at.segmented_control(key="doc_repo_admin_section").options
         for sub in ("Categories", "Users & Roles", "Access Grants", "Archived Records", "Audit Log"):
-            self.assertIn(sub, labels)
+            self.assertIn(sub, section_options)
 
     # -----------------------------------------------------------------
     # Admin tab: non-admin denied at the service level regardless of UI
@@ -1091,6 +1278,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
     def test_admin_add_user_via_ui(self):
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Users & Roles")
         at.text_input(key="doc_repo_admin_new_user_email").set_value("New.User@Example.test").run(timeout=30)
         at.selectbox(key="doc_repo_admin_new_user_role").set_value("Authorized Contributor").run(timeout=30)
         at.button(key="doc_repo_admin_add_user_btn").click().run(timeout=30)
@@ -1102,6 +1290,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
     def test_admin_add_user_invalid_email_rejected(self):
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Users & Roles")
         at.text_input(key="doc_repo_admin_new_user_email").set_value("not-an-email").run(timeout=30)
         at.button(key="doc_repo_admin_add_user_btn").click().run(timeout=30)
         self.assertFalse(at.exception)
@@ -1112,6 +1301,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
         documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Users & Roles")
         at.selectbox(key=f"doc_repo_admin_user_role::{VIEWER_EMAIL}").set_value("Authorized Contributor").run(timeout=30)
         at.button(key=f"doc_repo_admin_user_update_role_btn::{VIEWER_EMAIL}").click().run(timeout=30)
         self.assertFalse(at.exception)
@@ -1122,6 +1312,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
         documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Users & Roles")
         at.button(key=f"doc_repo_admin_user_deactivate_btn::{VIEWER_EMAIL}").click().run(timeout=30)
         self.assertFalse(at.exception)
         users = {u["email"]: u for u in documents_repo.list_doc_users(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
@@ -1144,6 +1335,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
         at.session_state["_test_actor_email"] = no_secret_admin
         at.run(timeout=30)
         at.button(key="select_Document Repository").click().run(timeout=30)
+        at = self._select_admin_section(at, "Users & Roles")
         self.assertFalse(at.exception)
 
         deactivate_btn = next(b for b in at.button if b.key == f"doc_repo_admin_user_deactivate_btn::{no_secret_admin}")
@@ -1166,6 +1358,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
         documents_repo.create_doc_user(ADMIN_EMAIL, ADMIN_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Users & Roles")
         self.assertFalse(at.exception)
 
         deactivate_btn = next(b for b in at.button if b.key == f"doc_repo_admin_user_deactivate_btn::{ADMIN_EMAIL}")
@@ -1180,6 +1373,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
         cat_id = documents_repo.create_category(ADMIN_EMAIL, "Grant Flow", secrets_getter=admin_secrets_getter)
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Access Grants")
 
         at.selectbox(key="doc_repo_admin_access_category").set_value(cat_id).run(timeout=30)
         at.text_input(key="doc_repo_admin_grant_email").set_value(VIEWER_EMAIL).run(timeout=30)
@@ -1213,6 +1407,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
 
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Archived Records")
         self.assertFalse(at.exception)
         restore_buttons = {b.key for b in at.button if b.key and b.key.startswith("doc_repo_admin_restore_btn::")}
         self.assertEqual(restore_buttons, {f"doc_repo_admin_restore_btn::{doc_a}", f"doc_repo_admin_restore_btn::{doc_b}"})
@@ -1221,6 +1416,18 @@ class DocumentRepositoryUITests(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertEqual(documents_repo.get_document_detail(ADMIN_EMAIL, doc_a, secrets_getter=admin_secrets_getter)["status"], documents_repo.STATUS_ACTIVE)
         self.assertEqual(documents_repo.get_document_detail(ADMIN_EMAIL, doc_b, secrets_getter=admin_secrets_getter)["status"], documents_repo.STATUS_ARCHIVED)
+
+    def test_admin_archived_records_shows_count_of_total(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Archived Count", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Doc", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.archive_document(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Archived Records")
+        self.assertFalse(at.exception)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("Showing 1-1 of 1", captions)
 
     # -----------------------------------------------------------------
     # Admin tab: audit log viewer
@@ -1231,6 +1438,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
 
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Audit Log")
         self.assertFalse(at.exception)
 
         audit_tables = [df for df in at.dataframe if "Action" in df.value.columns]
@@ -1243,6 +1451,13 @@ class DocumentRepositoryUITests(unittest.TestCase):
         audit_tables = [df for df in at.dataframe if "Action" in df.value.columns]
         self.assertTrue(all(a == "create_category" for a in audit_tables[0].value["Action"].tolist()))
 
+        # Count caption reflects the active filter, not the whole log.
+        filtered_count = documents_repo.count_audit_log(
+            ADMIN_EMAIL, action_filter="create_category", secrets_getter=admin_secrets_getter,
+        )
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn(f"Showing 1-{filtered_count} of {filtered_count}", captions)
+
     def test_admin_audit_log_to_today_still_shows_todays_rows(self):
         # Regression test for the date_to off-by-one: "To" defaulting
         # to today must not exclude rows created moments ago today --
@@ -1252,6 +1467,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
 
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        at = self._select_admin_section(at, "Audit Log")
         at.date_input(key="doc_repo_admin_audit_date_to").set_value(date.today()).run(timeout=30)
         self.assertFalse(at.exception)
 
@@ -1263,6 +1479,10 @@ class DocumentRepositoryUITests(unittest.TestCase):
         documents_repo.create_category(ADMIN_EMAIL, "![x](http://example.test/a.png) [click](http://example.test)", secrets_getter=admin_secrets_getter)
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        # Exercise the Audit Log section specifically, since that's what
+        # this test is proving survives malicious category names.
+        at = self._select_admin_section(at, "Audit Log")
         self.assertFalse(at.exception)
 
     # -----------------------------------------------------------------

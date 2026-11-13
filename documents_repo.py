@@ -1115,11 +1115,14 @@ def replace_document(
 ) -> str:
     """Adds a new version of an existing document without touching its
     old versions. Requires contribute (or manage/admin) access on the
-    document's category. Same write order/crash-safety guarantee as
-    add_document(): blob chunks, then the new version row, then
-    documents.current_version_id is updated to point at it, then the
-    audit row. If interrupted before the UPDATE, the document still
-    points at its previous (complete) version.
+    document's category -- or manage access (or admin) if the document
+    is archived, the same rule get_document_detail()/download_version()
+    use: view/contribute access only ever covers an active document.
+    Same write order/crash-safety guarantee as add_document(): blob
+    chunks, then the new version row, then documents.current_version_id
+    is updated to point at it, then the audit row. If interrupted
+    before the UPDATE, the document still points at its previous
+    (complete) version.
     """
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
@@ -1129,7 +1132,8 @@ def replace_document(
         if doc is None:
             raise ValueError(f"No such document: {document_id}")
         category_id = doc["category_id"]
-        if not _authorized_for_category(conn, actor_email, category_id, LEVEL_CONTRIBUTE, secrets_getter):
+        min_level = LEVEL_MANAGE if doc["status"] == STATUS_ARCHIVED else LEVEL_CONTRIBUTE
+        if not _authorized_for_category(conn, actor_email, category_id, min_level, secrets_getter):
             _deny(conn, actor_email, "replace_document", document_id=document_id, category_id=category_id)
 
         name, extension = validate_upload(filename, data)
@@ -1179,7 +1183,9 @@ def update_metadata(
 ) -> None:
     """Updates whichever of title/description/keywords are given (None
     leaves that field unchanged). Requires contribute (or manage/admin)
-    access on the document's category -- same level as uploading."""
+    access on the document's category -- same level as uploading -- or
+    manage access (or admin) if the document is archived, same rule as
+    replace_document()/get_document_detail()/download_version()."""
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
     _set_row_factory(conn)
@@ -1188,7 +1194,8 @@ def update_metadata(
         if doc is None:
             raise ValueError(f"No such document: {document_id}")
         category_id = doc["category_id"]
-        if not _authorized_for_category(conn, actor_email, category_id, LEVEL_CONTRIBUTE, secrets_getter):
+        min_level = LEVEL_MANAGE if doc["status"] == STATUS_ARCHIVED else LEVEL_CONTRIBUTE
+        if not _authorized_for_category(conn, actor_email, category_id, min_level, secrets_getter):
             _deny(conn, actor_email, "update_metadata", document_id=document_id, category_id=category_id)
 
         updates = {}
@@ -1223,7 +1230,12 @@ def archive_document(actor_email: str, document_id: str, db_path: Path = DEFAULT
     bar than the contribute level that covers everyday uploads/edits,
     since archiving affects visibility for everyone with access to the
     category. There is no permanent-delete counterpart; see
-    restore_document()."""
+    restore_document(). A no-op (no UPDATE, no new audit row) if the
+    document is already archived -- the original archived_at/
+    archived_by from the first archive are preserved rather than
+    overwritten by a later, redundant call. The authorization check
+    still runs first, so a caller without access is still denied (and
+    that denial still audited) regardless of the document's status."""
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
     _set_row_factory(conn)
@@ -1234,6 +1246,8 @@ def archive_document(actor_email: str, document_id: str, db_path: Path = DEFAULT
         category_id = doc["category_id"]
         if not _authorized_for_category(conn, actor_email, category_id, LEVEL_MANAGE, secrets_getter):
             _deny(conn, actor_email, "archive_document", document_id=document_id, category_id=category_id)
+        if doc["status"] == STATUS_ARCHIVED:
+            return
         now = _now()
         conn.execute(
             "UPDATE documents SET status = ?, archived_at = ?, archived_by = ?, updated_at = ?, updated_by = ? WHERE id = ?",
@@ -1247,7 +1261,10 @@ def archive_document(actor_email: str, document_id: str, db_path: Path = DEFAULT
 
 
 def restore_document(actor_email: str, document_id: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> None:
-    """Reverses archive_document(). Same manage-or-admin bar."""
+    """Reverses archive_document(). Same manage-or-admin bar. A no-op
+    (no UPDATE, no audit row) if the document is already active -- the
+    authorization check still runs first, so a caller without access
+    is still denied (and audited) regardless of the document's status."""
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
     _set_row_factory(conn)
@@ -1258,6 +1275,8 @@ def restore_document(actor_email: str, document_id: str, db_path: Path = DEFAULT
         category_id = doc["category_id"]
         if not _authorized_for_category(conn, actor_email, category_id, LEVEL_MANAGE, secrets_getter):
             _deny(conn, actor_email, "restore_document", document_id=document_id, category_id=category_id)
+        if doc["status"] != STATUS_ARCHIVED:
+            return
         now = _now()
         conn.execute(
             "UPDATE documents SET status = ?, archived_at = NULL, archived_by = NULL, updated_at = ?, updated_by = ? WHERE id = ?",
@@ -1268,6 +1287,76 @@ def restore_document(actor_email: str, document_id: str, db_path: Path = DEFAULT
         conn.commit()
     finally:
         conn.close()
+
+
+def _check_list_documents_access(conn, actor_email: str, is_admin: bool, category_id: int | None, status: str | None, action: str) -> None:
+    """Authorization shared by list_documents() and count_documents():
+    an explicit category_id needs at least view access, and archived
+    rows additionally need manage access on that category. Factored out
+    so the two functions can't drift on who is allowed to ask what."""
+    if category_id is not None and not is_admin and not _has_level(conn, actor_email, category_id, LEVEL_VIEW):
+        _deny(conn, actor_email, action, category_id=category_id)
+    if (
+        category_id is not None and status == STATUS_ARCHIVED and not is_admin
+        and not _has_level(conn, actor_email, category_id, LEVEL_MANAGE)
+    ):
+        _deny(conn, actor_email, action, category_id=category_id, detail="archived")
+
+
+def _list_documents_filter(
+    actor_email: str, is_admin: bool, category_id: int | None, search: str | None,
+    file_type: str | None, date_from: str | None, date_to: str | None, status: str | None,
+) -> tuple[list[str], list]:
+    """SQL WHERE-clause fragments and bound params shared by
+    list_documents() and count_documents(), so the two can never
+    disagree on what counts as visible."""
+    clauses: list[str] = []
+    params: list = []
+
+    if not is_admin:
+        clauses.append("d.category_id IN (SELECT category_id FROM doc_category_access WHERE subject = ?)")
+        params.append(actor_email)
+        if status is None or status == STATUS_ARCHIVED:
+            # Archived rows are only visible in categories where this
+            # actor has manage-level access -- view/contribute access
+            # only ever grants the active document. An explicit
+            # category_id without manage access was already denied by
+            # _check_list_documents_access() when status is exactly
+            # STATUS_ARCHIVED; for status=None (both statuses at once)
+            # this instead just quietly drops archived rows from
+            # categories below manage level, same as any other category
+            # this actor can't see.
+            clauses.append(
+                "(d.status != ? OR d.category_id IN "
+                "(SELECT category_id FROM doc_category_access WHERE subject = ? AND level = ?))"
+            )
+            params.extend([STATUS_ARCHIVED, actor_email, LEVEL_MANAGE])
+    if category_id is not None:
+        clauses.append("d.category_id = ?")
+        params.append(category_id)
+    if status:
+        clauses.append("d.status = ?")
+        params.append(status)
+    if search and search.strip():
+        like_term = f"%{_escape_like(search.strip())}%"
+        clauses.append("(d.title LIKE ? ESCAPE '\\' OR d.description LIKE ? ESCAPE '\\' OR d.keywords LIKE ? ESCAPE '\\')")
+        params.extend([like_term, like_term, like_term])
+    if file_type:
+        clauses.append("v.extension = ?")
+        params.append(file_type.lower().lstrip("."))
+    if date_from:
+        clauses.append("d.created_at >= ?")
+        params.append(date_from)
+    if date_to:
+        # created_at is a full timestamp (see _now()), e.g.
+        # "2026-11-13T21:21:23+00:00" -- a plain "<= date_to" would
+        # exclude every row created later in date_to's own day, since
+        # any such timestamp sorts AFTER the bare date string. Compare
+        # against the start of the following day instead, same fix as
+        # _list_audit_log_filter()'s date_to.
+        clauses.append("d.created_at < ?")
+        params.append((date.fromisoformat(date_to) + timedelta(days=1)).isoformat())
+    return clauses, params
 
 
 def list_documents(
@@ -1294,6 +1383,15 @@ def list_documents(
     'archived' for only archived). search escapes % and _ so they're
     matched literally rather than as LIKE wildcards.
 
+    date_from/date_to are calendar-day bounds (e.g. "2026-11-13") on
+    created_at, both inclusive of every row anywhere in that whole day
+    -- not a literal string comparison against the bound you passed.
+    created_at is a full timestamp (see _now()), so "created_at >=
+    date_from" alone already includes that whole day; date_to instead
+    compares "created_at < date_to + 1 day" so it includes every
+    moment of its own day and nothing from the day after (same
+    approach as list_audit_log()'s date_to).
+
     A category_id scoped to a category actor_email can't see raises
     PermissionDenied; an unscoped call instead just silently narrows to
     the categories actor_email (or everyone, if admin) can see -- that
@@ -1314,54 +1412,8 @@ def list_documents(
     _set_row_factory(conn)
     try:
         is_admin = _is_admin(conn, actor_email, secrets_getter)
-        if category_id is not None and not is_admin and not _has_level(conn, actor_email, category_id, LEVEL_VIEW):
-            _deny(conn, actor_email, "list_documents", category_id=category_id)
-        if (
-            category_id is not None and status == STATUS_ARCHIVED and not is_admin
-            and not _has_level(conn, actor_email, category_id, LEVEL_MANAGE)
-        ):
-            _deny(conn, actor_email, "list_documents", category_id=category_id, detail="archived")
-
-        clauses = []
-        params: list = []
-
-        if not is_admin:
-            clauses.append("d.category_id IN (SELECT category_id FROM doc_category_access WHERE subject = ?)")
-            params.append(actor_email)
-            if status is None or status == STATUS_ARCHIVED:
-                # Archived rows are only visible in categories where
-                # this actor has manage-level access -- view/contribute
-                # access only ever grants the active document. An
-                # explicit category_id without manage access was
-                # already denied above when status is exactly
-                # STATUS_ARCHIVED; for status=None (both statuses at
-                # once) this instead just quietly drops archived rows
-                # from categories below manage level, same as any
-                # other category this actor can't see.
-                clauses.append(
-                    "(d.status != ? OR d.category_id IN "
-                    "(SELECT category_id FROM doc_category_access WHERE subject = ? AND level = ?))"
-                )
-                params.extend([STATUS_ARCHIVED, actor_email, LEVEL_MANAGE])
-        if category_id is not None:
-            clauses.append("d.category_id = ?")
-            params.append(category_id)
-        if status:
-            clauses.append("d.status = ?")
-            params.append(status)
-        if search and search.strip():
-            like_term = f"%{_escape_like(search.strip())}%"
-            clauses.append("(d.title LIKE ? ESCAPE '\\' OR d.description LIKE ? ESCAPE '\\' OR d.keywords LIKE ? ESCAPE '\\')")
-            params.extend([like_term, like_term, like_term])
-        if file_type:
-            clauses.append("v.extension = ?")
-            params.append(file_type.lower().lstrip("."))
-        if date_from:
-            clauses.append("d.created_at >= ?")
-            params.append(date_from)
-        if date_to:
-            clauses.append("d.created_at <= ?")
-            params.append(date_to)
+        _check_list_documents_access(conn, actor_email, is_admin, category_id, status, "list_documents")
+        clauses, params = _list_documents_filter(actor_email, is_admin, category_id, search, file_type, date_from, date_to, status)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         page = max(page, 1)
@@ -1380,6 +1432,47 @@ def list_documents(
             (*params, page_size, offset),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_documents(
+    actor_email: str,
+    category_id: int | None = None,
+    search: str | None = None,
+    file_type: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status: str | None = STATUS_ACTIVE,
+    db_path: Path = DEFAULT_DB_PATH,
+    secrets_getter=None,
+) -> int:
+    """Same visibility/authorization rules as list_documents() -- in
+    fact the exact same filter-building and access-check code, factored
+    out into _list_documents_filter()/_check_list_documents_access() so
+    the two can never silently disagree -- but returns just a row
+    count. Meant for places (like the category list's per-category
+    counts) that only need a number: calling list_documents() with a
+    huge page_size just to take len() of the result means fetching and
+    deserializing every row's full metadata for nothing.
+    """
+    actor_email = _require_actor(actor_email)
+    conn = get_conn(db_path)
+    _set_row_factory(conn)
+    try:
+        is_admin = _is_admin(conn, actor_email, secrets_getter)
+        _check_list_documents_access(conn, actor_email, is_admin, category_id, status, "count_documents")
+        clauses, params = _list_documents_filter(actor_email, is_admin, category_id, search, file_type, date_from, date_to, status)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = conn.execute(
+            f"""SELECT COUNT(*) AS n
+                FROM documents d
+                LEFT JOIN document_versions v ON v.id = d.current_version_id
+                {where}""",
+            params,
+        ).fetchone()
+        return row["n"] if row else 0
     finally:
         conn.close()
 
@@ -1525,21 +1618,7 @@ def list_audit_log(
         if not _is_admin(conn, actor_email, secrets_getter):
             _deny(conn, actor_email, "list_audit_log")
 
-        clauses = []
-        params: list = []
-        if actor_filter and actor_filter.strip():
-            clauses.append("actor_email LIKE ? ESCAPE '\\'")
-            params.append(f"%{_escape_like(actor_filter.strip())}%")
-        if action_filter and action_filter.strip():
-            clauses.append("action LIKE ? ESCAPE '\\'")
-            params.append(f"%{_escape_like(action_filter.strip())}%")
-        if date_from:
-            clauses.append("ts >= ?")
-            params.append(date_from)
-        if date_to:
-            clauses.append("ts < ?")
-            params.append((date.fromisoformat(date_to) + timedelta(days=1)).isoformat())
-
+        clauses, params = _list_audit_log_filter(actor_filter, action_filter, date_from, date_to)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         page = max(page, 1)
         page_size = max(page_size, 1)
@@ -1550,5 +1629,55 @@ def list_audit_log(
             (*params, page_size, offset),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _list_audit_log_filter(
+    actor_filter: str | None, action_filter: str | None, date_from: str | None, date_to: str | None,
+) -> tuple[list[str], list]:
+    """SQL WHERE-clause fragments and bound params shared by
+    list_audit_log() and count_audit_log()."""
+    clauses: list[str] = []
+    params: list = []
+    if actor_filter and actor_filter.strip():
+        clauses.append("actor_email LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(actor_filter.strip())}%")
+    if action_filter and action_filter.strip():
+        clauses.append("action LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(action_filter.strip())}%")
+    if date_from:
+        clauses.append("ts >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("ts < ?")
+        params.append((date.fromisoformat(date_to) + timedelta(days=1)).isoformat())
+    return clauses, params
+
+
+def count_audit_log(
+    actor_email: str,
+    actor_filter: str | None = None,
+    action_filter: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    db_path: Path = DEFAULT_DB_PATH,
+    secrets_getter=None,
+) -> int:
+    """Same filters/authorization as list_audit_log() (admin only), but
+    a row count instead of rows -- for a "Showing X of N" caption next
+    to the audit log's pagination without fetching every row.
+    """
+    actor_email = _require_actor(actor_email)
+    conn = get_conn(db_path)
+    _set_row_factory(conn)
+    try:
+        if not _is_admin(conn, actor_email, secrets_getter):
+            _deny(conn, actor_email, "count_audit_log")
+
+        clauses, params = _list_audit_log_filter(actor_filter, action_filter, date_from, date_to)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM doc_audit_log {where}", params).fetchone()
+        return row["n"] if row else 0
     finally:
         conn.close()

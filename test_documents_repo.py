@@ -30,11 +30,13 @@ or:
     pytest test_documents_repo.py -v
 """
 import hashlib
+import inspect
 import io
 import os
 import sqlite3
 import tempfile
 import unittest
+import uuid
 import zipfile
 
 import documents_repo as dr
@@ -43,6 +45,7 @@ ADMIN = "admin@example.test"
 CONTRIBUTOR = "contributor@example.test"
 VIEWER = "viewer@example.test"
 OUTSIDER = "outsider@example.test"
+MANAGER = "manager@example.test"
 
 
 def admin_secrets():
@@ -471,6 +474,163 @@ class ArchiveRestoreTests(TempDbTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 security audit: closes denial-test gaps the audit found
+# (replace_document, update_metadata, restore_document, list_versions,
+# and get_document_detail's base view-level case had no DIRECT denial
+# test before this -- their underlying checks were already exercised
+# via other functions, but not through their own call sites), plus
+# documents the current, deliberately-unchanged behavior of
+# replace/edit/archive on an already-archived document (see
+# phase5_security_audit.md for the recommendation on that).
+# ---------------------------------------------------------------------------
+class Phase5AuditGapCoverageTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Audit Gaps", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, MANAGER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.doc_id = dr.add_document(
+            ADMIN, self.category_id, "Gap Doc", make_pdf(), "a.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+
+    def test_replace_document_denied_for_viewer(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.replace_document(VIEWER, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_replace_document_denied_for_outsider(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.replace_document(OUTSIDER, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_update_metadata_denied_for_viewer(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.update_metadata(VIEWER, self.doc_id, title="New Title", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_update_metadata_denied_for_outsider(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.update_metadata(OUTSIDER, self.doc_id, title="New Title", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_restore_document_denied_for_contributor(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.restore_document(CONTRIBUTOR, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_restore_document_denied_for_outsider(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.restore_document(OUTSIDER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_list_versions_denied_for_outsider(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.list_versions(OUTSIDER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_get_document_detail_denied_for_outsider_on_active_doc(self):
+        # The existing denial tests for get_document_detail() were all
+        # archived-document-specific; this is the base view-level case.
+        with self.assertRaises(dr.PermissionDenied):
+            dr.get_document_detail(OUTSIDER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    # -- Fixed behavior on an already-archived document (Phase 5 review) --
+    def test_replace_document_denied_for_contributor_on_archived_document(self):
+        # Fixed in Phase 5 review: a contributor (contribute-level, not
+        # manage) is no longer allowed to replace an archived
+        # document's file.
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.replace_document(CONTRIBUTOR, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_replace_document_denial_on_archived_document_is_audited(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.replace_document(CONTRIBUTOR, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "replace_document_denied")), 1)
+
+    def test_replace_document_allowed_for_manager_on_archived_document(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.replace_document(MANAGER, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(detail["status"], dr.STATUS_ARCHIVED)
+        self.assertEqual(len(detail["versions"]), 2)
+
+    def test_replace_document_allowed_for_admin_on_archived_document(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.replace_document(ADMIN, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(detail["versions"]), 2)
+
+    def test_replace_document_still_allowed_for_contributor_on_active_document(self):
+        # Active documents are unaffected by the fix.
+        dr.replace_document(CONTRIBUTOR, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(detail["versions"]), 2)
+
+    def test_update_metadata_denied_for_contributor_on_archived_document(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.update_metadata(CONTRIBUTOR, self.doc_id, title="Edited While Archived", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_update_metadata_denial_on_archived_document_is_audited(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.update_metadata(CONTRIBUTOR, self.doc_id, title="Edited While Archived", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "update_metadata_denied")), 1)
+
+    def test_update_metadata_allowed_for_manager_on_archived_document(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.update_metadata(MANAGER, self.doc_id, title="Edited While Archived", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(detail["title"], "Edited While Archived")
+        self.assertEqual(detail["status"], dr.STATUS_ARCHIVED)
+
+    def test_update_metadata_allowed_for_admin_on_archived_document(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.update_metadata(ADMIN, self.doc_id, title="Edited While Archived", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(detail["title"], "Edited While Archived")
+
+    def test_update_metadata_still_allowed_for_contributor_on_active_document(self):
+        dr.update_metadata(CONTRIBUTOR, self.doc_id, title="Edited While Active", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(detail["title"], "Edited While Active")
+
+    def test_archiving_an_already_archived_document_is_a_no_op(self):
+        # Fixed in Phase 5 review: archive_document() on an already-
+        # archived document no longer re-stamps archived_at/archived_by
+        # or writes a second audit row.
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        first = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+        dr.archive_document(MANAGER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        second = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+        self.assertEqual(first["archived_by"], ADMIN)
+        self.assertEqual(second["archived_by"], ADMIN)
+        self.assertEqual(first["archived_at"], second["archived_at"])
+        self.assertEqual(len(audit_rows(self.db_path, "archive_document")), 1)
+
+    def test_archiving_an_already_archived_document_still_denies_unauthorized_caller(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.archive_document(OUTSIDER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "archive_document_denied")), 1)
+
+    def test_restoring_an_already_active_document_is_a_no_op(self):
+        # Fixed in Phase 5 review: restore_document() on an already-
+        # active document writes no audit row (previously it wrote one
+        # every time, even with nothing to actually restore).
+        before = len(audit_rows(self.db_path, "restore_document"))
+        dr.restore_document(MANAGER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "restore_document")), before)
+
+    def test_restoring_an_already_active_document_still_denies_unauthorized_caller(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.restore_document(OUTSIDER, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "restore_document_denied")), 1)
+
+
+# ---------------------------------------------------------------------------
 # list_documents()'s archived-visibility rule: manage-level (or admin)
 # only -- view/contribute access never grants archived rows.
 # ---------------------------------------------------------------------------
@@ -697,6 +857,151 @@ class SearchFilterPaginationTests(TempDbTestCase):
         results = dr.list_documents(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["id"], doc_id)
+
+
+# ---------------------------------------------------------------------------
+# date_to/date_from on list_documents()/count_documents(): calendar-day
+# bounds, not a literal string comparison against created_at (a full UTC
+# timestamp). This is the same bug class list_audit_log()'s date_to had,
+# fixed in Phase 5 review -- created_at has no public-API way to inject an
+# arbitrary value, so these insert documents rows directly, same way
+# ListAuditLogTests does for doc_audit_log.
+# ---------------------------------------------------------------------------
+class BrowseDateFilterTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Date Filter", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def _insert_document_with_created_at(self, created_at: str) -> str:
+        document_id = uuid.uuid4().hex
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """INSERT INTO documents (
+                id, category_id, title, description, keywords, status,
+                current_version_id, created_at, created_by, updated_at, updated_by
+            ) VALUES (?, ?, ?, '', '', ?, NULL, ?, ?, ?, ?)""",
+            (document_id, self.category_id, "Dated Doc", dr.STATUS_ACTIVE, created_at, ADMIN, created_at, ADMIN),
+        )
+        conn.commit()
+        conn.close()
+        return document_id
+
+    def test_date_to_includes_a_document_created_at_any_time_on_that_day(self):
+        # This is the exact case the bug affected: a plain "created_at
+        # <= date_to" excluded every row on date_to's own day, since a
+        # real timestamp like "2026-11-13T23:59:59+00:00" sorts AFTER
+        # the bare string "2026-11-13".
+        self._insert_document_with_created_at("2026-11-13T23:59:59+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+        count = dr.count_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_date_to_includes_a_document_created_at_the_very_start_of_that_day_too(self):
+        self._insert_document_with_created_at("2026-11-13T00:00:00+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+        count = dr.count_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_day_after_date_to_is_excluded(self):
+        self._insert_document_with_created_at("2026-11-14T00:00:00+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+        count = dr.count_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 0)
+
+    def test_date_from_includes_a_document_at_the_very_start_of_that_day(self):
+        self._insert_document_with_created_at("2026-11-13T00:00:00+00:00")
+        results = dr.list_documents(ADMIN, date_from="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+        count = dr.count_documents(ADMIN, date_from="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_day_before_date_from_is_excluded(self):
+        self._insert_document_with_created_at("2026-11-12T23:59:59+00:00")
+        results = dr.list_documents(ADMIN, date_from="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+        count = dr.count_documents(ADMIN, date_from="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 0)
+
+
+# ---------------------------------------------------------------------------
+# count_documents(): same filters/authorization as list_documents(), but a
+# number instead of rows -- added in Phase 5 so the category list doesn't
+# have to fetch every row just to call len() on it.
+# ---------------------------------------------------------------------------
+class CountDocumentsTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Countable", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def _add(self, title, filename="a.pdf", data=None, keywords=""):
+        return dr.add_document(
+            ADMIN, self.category_id, title, data or make_pdf(), filename, keywords=keywords,
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+
+    def test_count_matches_list_length_unfiltered(self):
+        for i in range(4):
+            self._add(f"Doc {i}")
+        count = dr.count_documents(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        listed = dr.list_documents(ADMIN, page_size=10_000, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 4)
+        self.assertEqual(count, len(listed))
+
+    def test_count_matches_list_length_with_category_filter(self):
+        other_cat = dr.create_category(ADMIN, "Other", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self._add("In Countable")
+        dr.add_document(ADMIN, other_cat, "In Other", make_pdf(), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        count = dr.count_documents(ADMIN, category_id=self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_count_matches_list_length_with_search(self):
+        self._add("50% Off Report")
+        self._add("Unrelated")
+        count = dr.count_documents(ADMIN, search="50%", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_count_matches_list_length_with_file_type(self):
+        self._add("PDF Doc", filename="a.pdf", data=make_pdf())
+        self._add("PNG Doc", filename="a.png", data=make_png())
+        count = dr.count_documents(ADMIN, file_type="png", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_count_excludes_archived_by_default(self):
+        doc_id = self._add("Will Archive")
+        self._add("Stays Active")
+        dr.archive_document(ADMIN, doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        count = dr.count_documents(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_count_scoped_to_viewers_own_access(self):
+        other_cat = dr.create_category(ADMIN, "No Access For Viewer", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self._add("Visible To Viewer")
+        dr.add_document(ADMIN, other_cat, "Not Visible To Viewer", make_pdf(), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        count = dr.count_documents(VIEWER, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_count_denied_for_explicit_category_outsider_cannot_see(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.count_documents(OUTSIDER, category_id=self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_count_archived_denied_without_manage_level(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.count_documents(
+                CONTRIBUTOR, category_id=self.category_id, status=dr.STATUS_ARCHIVED,
+                db_path=self.db_path, secrets_getter=self.secrets_getter,
+            )
+
+    def test_count_denial_is_audited(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.count_documents(OUTSIDER, category_id=self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "count_documents_denied")), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1344,23 @@ class ListAuditLogTests(TempDbTestCase):
         dr.list_audit_log(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
         self.assertEqual(len(audit_rows(self.db_path)), before)
 
+    def test_count_matches_unpaginated_list_length(self):
+        for i in range(5):
+            dr.create_category(ADMIN, f"Count Cat {i}", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        count = dr.count_audit_log(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        all_rows = dr.list_audit_log(ADMIN, page_size=10_000, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, len(all_rows))
+
+    def test_count_respects_filters(self):
+        count = dr.count_audit_log(ADMIN, action_filter="create_category", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        rows = dr.list_audit_log(ADMIN, action_filter="create_category", page_size=10_000, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, len(rows))
+        self.assertGreater(count, 0)
+
+    def test_count_denied_for_non_admin(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.count_audit_log(CONTRIBUTOR, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
     # -----------------------------------------------------------------
     # date_from/date_to: whole-calendar-day bounds, not a literal
     # string comparison against ts (a full UTC timestamp). ts has no
@@ -1112,6 +1434,77 @@ class ListAuditLogTests(TempDbTestCase):
         )
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(r["ts"].startswith("2026-11-13") for r in rows))
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 security audit: every public function in documents_repo.py
+# must be on this allowlist -- see ~/Documents/phase2-review/
+# phase5_security_audit.md for the full authorization table (who may
+# call each one, where the check happens, which test proves a denied
+# caller is rejected). Adding a new public function without adding it
+# here (and reviewing it there) makes this test fail on purpose, so
+# authorization review can't be silently skipped.
+# ---------------------------------------------------------------------------
+_AUTHORIZATION_REVIEWED_FUNCTIONS = {
+    # Infrastructure -- no actor_email parameter, not a security
+    # boundary by design (ensure_schema/get_conn just open a
+    # connection and create tables; sanitize_filename/validate_upload
+    # are pure content-validation utilities with no DB access at all).
+    "ensure_schema", "get_conn", "sanitize_filename", "validate_upload",
+    # Read-only visibility checks that never raise and never return
+    # another identity's secret/role (is_admin*) or more than the
+    # caller's own access (get_access_level, categories_with_min_level).
+    "is_admin", "is_admin_via_secret", "get_access_level", "categories_with_min_level",
+    # Deliberately NOT gated at the function level -- a one-time
+    # bootstrap helper not wired into any call site; see its own
+    # docstring. Reviewed and accepted as a documented exception, not
+    # an oversight.
+    "seed_default_categories",
+    # Admin only.
+    "create_category", "rename_category", "reorder_categories",
+    "deactivate_category", "reactivate_category",
+    "grant_category_access", "revoke_category_access", "list_category_access",
+    "create_doc_user", "update_doc_user_role", "deactivate_doc_user",
+    "reactivate_doc_user", "list_doc_users", "list_audit_log", "count_audit_log",
+    # Scoped visibility (admin sees everything; everyone else sees
+    # only what they have at least view access to) -- list_categories
+    # never raises; list_documents raises only for an explicit
+    # category_id the caller can't see at all.
+    "list_categories", "list_documents", "count_documents",
+    # Per-category level checks, enforced inside the function itself.
+    "find_duplicate_by_sha256",  # view
+    "add_document", "replace_document", "update_metadata",  # contribute
+    "archive_document", "restore_document",  # manage
+    "get_document_detail", "list_versions",  # view, or manage if archived
+    "download_version",  # view (current)/contribute (old), or manage if archived
+}
+
+
+class AuthorizationAllowlistTests(unittest.TestCase):
+    @staticmethod
+    def _public_functions() -> set[str]:
+        return {
+            name for name, obj in inspect.getmembers(dr, inspect.isfunction)
+            if not name.startswith("_") and obj.__module__ == dr.__name__
+        }
+
+    def test_every_public_function_is_on_the_reviewed_allowlist(self):
+        unreviewed = self._public_functions() - _AUTHORIZATION_REVIEWED_FUNCTIONS
+        self.assertEqual(
+            unreviewed, set(),
+            f"New public function(s) {unreviewed} added to documents_repo.py without "
+            "being added to _AUTHORIZATION_REVIEWED_FUNCTIONS above. Before adding it "
+            "there: determine who may call it, confirm where that check happens in the "
+            "function itself, and add a test proving a denied caller is rejected -- "
+            "then record all three in phase5_security_audit.md's table.",
+        )
+
+    def test_allowlist_has_no_stale_entries(self):
+        # Catches the opposite mistake: a function removed or renamed
+        # but left behind in the allowlist, which would otherwise mask
+        # a real "this function no longer exists" bug.
+        stale = _AUTHORIZATION_REVIEWED_FUNCTIONS - self._public_functions()
+        self.assertEqual(stale, set())
 
 
 # ---------------------------------------------------------------------------
