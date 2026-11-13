@@ -353,6 +353,57 @@ def _is_admin(conn, actor_email: str, secrets_getter=None) -> bool:
     return bool(row and row[0] == ROLE_ADMIN and row[1])
 
 
+def is_admin(actor_email: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> bool:
+    """Read-only, side-effect-free admin check for callers (e.g. a page
+    that decides whether to show a tile) that only want a yes/no answer
+    and must never provision anything just by asking.
+
+    Unlike every other function in this module, this deliberately does
+    NOT go through get_conn(): that would run ensure_schema() and
+    silently create this module's 7 tables the first time anyone merely
+    *looks* at whether to show an admin-only link. Instead it opens its
+    own connection, confirms doc_users already exists before querying
+    it, and never writes anything -- no audit row either, since this
+    isn't a mutation or a document access, just a visibility check.
+
+    Never raises: a missing table, a missing/unreachable database, or a
+    malformed secret all simply mean "not an admin" rather than an
+    error reaching the caller.
+    """
+    try:
+        actor_email = _normalize_email(actor_email)
+        if not actor_email:
+            return False
+        if actor_email in _admin_emails_from_secret(secrets_getter):
+            return True
+
+        turso_url, turso_token = _turso_credentials()
+        if turso_url:
+            if turso_serverless is None:
+                return False
+            conn = turso_serverless.connect(turso_url, auth_token=turso_token)
+        else:
+            # Read-only URI connect -- unlike a plain sqlite3.connect(),
+            # this raises instead of creating db_path if it doesn't
+            # exist yet, so a mere visibility check can never conjure a
+            # database file into existence.
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'doc_users'"
+            ).fetchone()
+            if not exists:
+                return False
+            row = conn.execute(
+                "SELECT role, is_active FROM doc_users WHERE email = ?", (actor_email,)
+            ).fetchone()
+            return bool(row and row[0] == ROLE_ADMIN and row[1])
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 def _access_level(conn, actor_email: str, category_id) -> str | None:
     row = conn.execute(
         "SELECT level FROM doc_category_access WHERE category_id = ? AND subject = ?",
@@ -1129,12 +1180,15 @@ def list_documents(
     secrets_getter=None,
 ) -> list[dict]:
     """Metadata only -- joins document_versions for the current
-    version's filename/extension/size, never document_blobs. category
-    filtering/search/file_type/date_from/date_to/status are all
-    optional; status defaults to 'active' so archived documents stay
-    out of the normal list (pass status=None for both, or 'archived'
-    for only archived). search escapes % and _ so they're matched
-    literally rather than as LIKE wildcards.
+    version's filename/extension/size/uploaded_at/uploaded_by/version_no
+    (as current_extension/current_filename/current_size_bytes/
+    current_uploaded_at/current_uploaded_by/current_version_no), never
+    document_blobs.
+    category filtering/search/file_type/date_from/date_to/status are
+    all optional; status defaults to 'active' so archived documents
+    stay out of the normal list (pass status=None for both, or
+    'archived' for only archived). search escapes % and _ so they're
+    matched literally rather than as LIKE wildcards.
 
     A category_id scoped to a category actor_email can't see raises
     PermissionDenied; an unscoped call instead just silently narrows to
@@ -1182,7 +1236,8 @@ def list_documents(
 
         rows = conn.execute(
             f"""SELECT d.*, v.extension AS current_extension, v.filename AS current_filename,
-                       v.size_bytes AS current_size_bytes
+                       v.size_bytes AS current_size_bytes, v.uploaded_at AS current_uploaded_at,
+                       v.uploaded_by AS current_uploaded_by, v.version_no AS current_version_no
                 FROM documents d
                 LEFT JOIN document_versions v ON v.id = d.current_version_id
                 {where}

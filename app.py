@@ -57,6 +57,7 @@ import hmac
 import io
 import json
 import os
+import time
 import uuid
 
 import streamlit as st
@@ -68,6 +69,20 @@ import backend
 # View's use of SUBJECTS / map_to_subjects is visible at the top of the
 # file instead of hidden inside another module's namespace.
 import parsing_engine as pe
+
+# Document Repository (Phase 2: browse/search/download tile + screen).
+# Imported in try/except on purpose -- if either module is missing or
+# fails to import for any reason, the tile is simply hidden and nothing
+# else in this file is affected. Not a new dependency: both modules are
+# pure standard library plus streamlit, same as the rest of this app.
+try:
+    import documents_repo
+    import documents_ui
+    _DOCUMENTS_REPO_AVAILABLE = True
+except Exception:
+    documents_repo = None
+    documents_ui = None
+    _DOCUMENTS_REPO_AVAILABLE = False
 
 # True only when the process was launched by pytest -- which is how the
 # UI tests in test_weekly_report.py drive this file via AppTest. This
@@ -596,6 +611,7 @@ TASK_ICONS = {
     "Trip Preference Parsing": "\U0001F4CB",  # clipboard
     "Flight Planning Parsing": "\U0001F6EB",  # departure
     "Weekly Report": "\U0001F4CA",  # bar chart
+    "Document Repository": "\U0001F4C1",  # folder
 }
 TASK_DESCRIPTIONS = {
     "Trip Preference Parsing": "Parse a completed Trip Support Service Preferences "
@@ -604,7 +620,12 @@ TASK_DESCRIPTIONS = {
                                 "into the Flight Plan Template.",
     "Weekly Report": "Submit your weekly update, or compile everyone's "
                      "submissions into one team report.",
+    "Document Repository": "Browse, search, and download documents shared with your team.",
 }
+
+# Document Repository is NOT in TASKS -- it is an admin-only tile added
+# conditionally at render time (see TILES, computed just before the
+# landing screen below), never a static task everyone sees.
 
 # Tasks that are visible on the landing screen but not selectable yet --
 # rendered grayed-out with a diagonal "on hold" banner instead of a
@@ -879,6 +900,130 @@ if not _RUNNING_UNDER_TEST:
             st.stop()
 
         st.caption("Temporary shared-password access (Okta SSO not yet configured)")
+
+
+# ---------------------------------------------------------------------------
+# Document Repository tile visibility -- see the module-level import
+# try/except above for _DOCUMENTS_REPO_AVAILABLE.
+# ---------------------------------------------------------------------------
+def _document_repository_actor_email() -> str | None:
+    """The signed-in user's lowercased email, but ONLY when real Okta
+    sign-in is confirmed -- never the shared-password stopgap, and
+    never under the test harness unless a test has explicitly set
+    st.session_state["_test_actor_email"] first. (AppTest has no
+    supported way to populate a real st.user OIDC identity -- see
+    _RUNNING_UNDER_TEST's own docstring above -- so without that
+    explicit test-only override, this returns None under test, same
+    as "not signed in".) Returns None in every other case.
+    """
+    if _RUNNING_UNDER_TEST:
+        test_email = st.session_state.get("_test_actor_email")
+        return (test_email or "").strip().lower() or None
+    if not _auth_is_configured():
+        return None  # shared-password stopgap, or auth not set up at all
+    try:
+        if not st.user.is_logged_in:
+            return None
+    except Exception:
+        return None
+    return (st.user.get("email") or "").strip().lower() or None
+
+
+# How long a tile-visibility result is trusted before being
+# recomputed -- see _can_see_document_repository() below.
+_DOCUMENT_REPO_VISIBILITY_TTL_SECONDS = 300
+
+
+def _cache_clock() -> float:
+    """The monotonic clock _can_see_document_repository()'s TTL cache
+    is measured against -- real time.monotonic(), except under the
+    test harness, where a test can override it via
+    st.session_state["_test_clock"] (same test-only-override pattern
+    as _test_actor_email elsewhere in this file). Patching the bare
+    global time.monotonic directly isn't safe here: AppTest's own
+    internals (e.g. its run(timeout=...) handling) read that same
+    global clock, so a global patch's side_effect sequence gets
+    consumed by Streamlit's internals too, not just by this function.
+    This override is scoped to exactly one call site instead.
+    """
+    if _RUNNING_UNDER_TEST:
+        override = st.session_state.get("_test_clock")
+        if override is not None:
+            return override
+    return time.monotonic()
+
+
+def _can_see_document_repository(actor_email: str | None) -> bool:
+    """Cached wrapper around _compute_can_see_document_repository()
+    below -- this runs on every rerun for every user, so without
+    caching, every non-admin visitor pays for a fresh
+    documents_repo.is_admin() Turso round trip (two queries) just to
+    render the landing screen's existing tiles.
+
+    The result is cached in st.session_state (per-session, never
+    shared across users/visitors) keyed to actor_email, and reused
+    for up to _DOCUMENT_REPO_VISIBILITY_TTL_SECONDS -- a False result
+    is cached too, since an ordinary user reruns this just as often as
+    an admin does. Recomputed immediately if actor_email itself
+    changes (e.g. a different person signs in in the same browser
+    session) rather than waiting out a stale TTL for the wrong email.
+    """
+    if not _DOCUMENTS_REPO_AVAILABLE or not actor_email:
+        return False
+
+    cached = st.session_state.get("_doc_repo_tile_visibility_cache")
+    now = _cache_clock()
+    if (
+        cached is not None
+        and cached["email"] == actor_email
+        and (now - cached["checked_at"]) < _DOCUMENT_REPO_VISIBILITY_TTL_SECONDS
+    ):
+        return cached["visible"]
+
+    visible = _compute_can_see_document_repository(actor_email)
+    st.session_state["_doc_repo_tile_visibility_cache"] = {
+        "email": actor_email, "visible": visible, "checked_at": now,
+    }
+    return visible
+
+
+def _compute_can_see_document_repository(actor_email: str) -> bool:
+    """The actual (uncached) check -- see _can_see_document_repository()
+    above for the per-session TTL cache wrapped around this. True only
+    if the Document Repository imported successfully and EITHER:
+      (a) actor_email is an admin -- documents_repo.is_admin(), which
+          checks the DOC_REPO_ADMIN_EMAILS secret or an active
+          doc_users admin row. The only path actually used today.
+      (b) the DOC_REPO_ENABLED secret is exactly "true" AND actor_email
+          has an active doc_users row or at least one category access
+          grant. Implemented for completeness; DOC_REPO_ENABLED is
+          unset by default, so this path is inert until deliberately
+          turned on.
+    Never raises -- any failure here just hides the tile.
+    """
+    if not _DOCUMENTS_REPO_AVAILABLE:
+        return False
+    try:
+        if documents_repo.is_admin(actor_email, secrets_getter=lambda: st.secrets):
+            return True
+        if (st.secrets.get("DOC_REPO_ENABLED") or "").strip().lower() != "true":
+            return False
+        conn = documents_repo.get_conn()
+        try:
+            user_row = conn.execute(
+                "SELECT is_active FROM doc_users WHERE email = ?", (actor_email,)
+            ).fetchone()
+            if user_row and user_row[0]:
+                return True
+            access_row = conn.execute(
+                "SELECT 1 FROM doc_category_access WHERE subject = ? LIMIT 1", (actor_email,)
+            ).fetchone()
+            return access_row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Login splash -- plays once per browser session, right after sign-in.
@@ -2135,13 +2280,20 @@ if not _RUNNING_UNDER_TEST:
 if "task" not in st.session_state:
     st.session_state["task"] = None
 
+_document_repo_actor_email = _document_repository_actor_email()
+_show_document_repository_tile = _can_see_document_repository(_document_repo_actor_email)
+
+# Exactly TASKS, unchanged, when the tile is hidden -- so the landing
+# screen's columns/layout are identical to before this tile existed.
+TILES = TASKS + ["Document Repository"] if _show_document_repository_tile else TASKS
+
 # ---------------------------------------------------------------------------
 # Landing screen: pick a task
 # ---------------------------------------------------------------------------
 if st.session_state["task"] is None:
     st.subheader("What would you like to do?")
-    cols = st.columns(len(TASKS))
-    for col, task_name in zip(cols, TASKS):
+    cols = st.columns(len(TILES))
+    for col, task_name in zip(cols, TILES):
         with col:
             if task_name in DISABLED_TASKS:
                 st.markdown(
@@ -2191,6 +2343,13 @@ with col_title:
     st.subheader(f"{TASK_ICONS[st.session_state['task']]} {st.session_state['task']}")
 
 task = st.session_state["task"]
+
+# Permission can change between page loads (e.g. an admin's access is
+# revoked mid-session) -- re-checked here, not just at selection time,
+# so a stale session can never keep showing this screen.
+if task == "Document Repository" and not _show_document_repository_tile:
+    st.session_state["task"] = None
+    st.rerun()
 
 # ---------------------------------------------------------------------------
 # Trip Preference Parsing -- fully wired to the existing pipeline
@@ -2938,3 +3097,11 @@ elif task == "Weekly Report":
                     st.success(f"Sent to {len(recipients)} recipient(s).")
                 except (ValueError, RuntimeError) as e:
                     st.error(str(e))
+
+# ---------------------------------------------------------------------------
+# Document Repository -- Phase 2: browse/search/download only. See
+# documents_ui.py for the screen itself; permission is already
+# re-checked above (right after `task = st.session_state["task"]`).
+# ---------------------------------------------------------------------------
+elif task == "Document Repository":
+    documents_ui.render_document_repository(_document_repo_actor_email)

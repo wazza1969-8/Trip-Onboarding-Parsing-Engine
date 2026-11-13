@@ -16,6 +16,9 @@ backend foundation only):
     attempt
   - the DOC_REPO_ADMIN_EMAILS secret-based admin working with zero
     doc_users rows
+  - is_admin(): the side-effect-free admin probe used by app.py to
+    decide whether to show the Document Repository tile -- never
+    creates tables, never writes audit rows, never raises
 
 All tests use a fresh temporary SQLite file (never the production
 Turso database, never a shared file) and store only fake/synthetic
@@ -507,6 +510,23 @@ class SearchFilterPaginationTests(TempDbTestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["title"], "PNG Doc")
 
+    def test_current_version_upload_metadata_present(self):
+        self._add("Uploaded Doc", filename="a.pdf")
+        results = dr.list_documents(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["current_uploaded_by"], ADMIN)
+        self.assertTrue(results[0]["current_uploaded_at"])
+        self.assertEqual(results[0]["current_version_no"], 1)
+
+    def test_current_version_upload_metadata_reflects_latest_replace(self):
+        doc_id = self._add("Replaced Doc", filename="a.pdf")
+        dr.grant_category_access(ADMIN, self.category_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.replace_document(CONTRIBUTOR, doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        results = dr.list_documents(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results[0]["current_uploaded_by"], CONTRIBUTOR)
+        self.assertEqual(results[0]["current_filename"], "b.pdf")
+        self.assertEqual(results[0]["current_version_no"], 2)
+
     def test_date_filters_exclude_out_of_range(self):
         self._add("Today's Doc")
         future = "2999-01-01"
@@ -594,6 +614,87 @@ class SecretAdminBootstrapTests(TempDbTestCase):
 
         category_id = dr.create_category(ADMIN, "Bootstrap", db_path=self.db_path, secrets_getter=admin_secrets())
         self.assertTrue(category_id)
+
+
+# ---------------------------------------------------------------------------
+# is_admin() -- the side-effect-free probe app.py uses to decide
+# whether to show the Document Repository tile.
+# ---------------------------------------------------------------------------
+class IsAdminTests(unittest.TestCase):
+    def test_empty_actor_returns_false(self):
+        self.assertFalse(dr.is_admin(""))
+
+    def test_true_via_secret_without_touching_db(self):
+        missing_path = os.path.join(tempfile.mkdtemp(), "never_created.db")
+        self.assertFalse(os.path.exists(missing_path))
+        self.assertTrue(dr.is_admin(ADMIN, db_path=missing_path, secrets_getter=admin_secrets()))
+        # The secret matched before any connection was even attempted.
+        self.assertFalse(os.path.exists(missing_path))
+
+    def test_false_when_db_file_does_not_exist_at_all(self):
+        missing_path = os.path.join(tempfile.mkdtemp(), "never_created.db")
+        self.assertFalse(dr.is_admin(OUTSIDER, db_path=missing_path))
+        # A visibility check must never conjure a database file into existence.
+        self.assertFalse(os.path.exists(missing_path))
+
+    def test_false_when_doc_users_table_does_not_exist(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            # A real SQLite file, but ensure_schema() was never run on it --
+            # no doc_users table at all.
+            sqlite3.connect(path).close()
+            self.assertFalse(dr.is_admin(OUTSIDER, db_path=path))
+            conn = sqlite3.connect(path)
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            conn.close()
+            self.assertEqual(tables, set())  # confirms is_admin created nothing
+        finally:
+            os.remove(path)
+
+    def test_true_for_active_admin_doc_users_row(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            dr.create_doc_user(ADMIN, "second-admin@example.test", dr.ROLE_ADMIN, db_path=path, secrets_getter=admin_secrets())
+            self.assertTrue(dr.is_admin("second-admin@example.test", db_path=path))
+        finally:
+            os.remove(path)
+
+    def test_false_for_non_admin_role(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            dr.create_doc_user(ADMIN, CONTRIBUTOR, dr.ROLE_CONTRIBUTOR, db_path=path, secrets_getter=admin_secrets())
+            self.assertFalse(dr.is_admin(CONTRIBUTOR, db_path=path))
+        finally:
+            os.remove(path)
+
+    def test_false_for_inactive_admin(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            dr.create_doc_user(ADMIN, "second-admin@example.test", dr.ROLE_ADMIN, db_path=path, secrets_getter=admin_secrets())
+            dr.deactivate_doc_user(ADMIN, "second-admin@example.test", db_path=path, secrets_getter=admin_secrets())
+            self.assertFalse(dr.is_admin("second-admin@example.test", db_path=path))
+        finally:
+            os.remove(path)
+
+    def test_never_writes_an_audit_row(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            dr.create_doc_user(ADMIN, "second-admin@example.test", dr.ROLE_ADMIN, db_path=path, secrets_getter=admin_secrets())
+            before = len(audit_rows(path))
+            dr.is_admin("second-admin@example.test", db_path=path)
+            dr.is_admin(OUTSIDER, db_path=path)
+            self.assertEqual(len(audit_rows(path)), before)
+        finally:
+            os.remove(path)
+
+    def test_malformed_db_path_never_raises(self):
+        # A directory can never be opened as a SQLite file.
+        self.assertFalse(dr.is_admin(OUTSIDER, db_path=tempfile.mkdtemp()))
 
 
 # ---------------------------------------------------------------------------
