@@ -542,6 +542,76 @@ class ArchivedListingAccessTests(TempDbTestCase):
         docs = dr.list_documents(OUTSIDER, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
         self.assertEqual(docs, [])
 
+    # -----------------------------------------------------------------
+    # Phase 4 Part A: get_document_detail() / download_version() must
+    # apply the same archived-requires-manage rule as list_documents(),
+    # closing the "known by ID" bypass -- see each function's own
+    # docstring.
+    # -----------------------------------------------------------------
+    def test_get_document_detail_denied_for_viewer_on_archived_doc(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.get_document_detail(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_get_document_detail_denied_for_contributor_on_archived_doc(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.get_document_detail(CONTRIBUTOR, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_get_document_detail_allowed_for_manage_level_on_archived_doc(self):
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["id"], self.archived_id)
+
+    def test_get_document_detail_allowed_for_admin_on_archived_doc(self):
+        detail = dr.get_document_detail(ADMIN, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNotNone(detail)
+
+    def test_get_document_detail_unchanged_for_viewer_on_active_doc(self):
+        detail = dr.get_document_detail(VIEWER, self.active_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["id"], self.active_id)
+
+    def test_download_version_denied_for_viewer_on_archived_doc_current_version(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.download_version(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_download_version_denied_for_contributor_on_archived_doc(self):
+        # Contributors may download an ACTIVE document's old versions,
+        # but archived status overrides that -- manage (or admin) only.
+        with self.assertRaises(dr.PermissionDenied):
+            dr.download_version(CONTRIBUTOR, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_download_version_allowed_for_manage_level_on_archived_doc(self):
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        filename, _, data = dr.download_version(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(filename, "archived.pdf")
+        self.assertEqual(data, make_pdf())
+
+    def test_download_version_allowed_for_admin_on_archived_doc(self):
+        filename, _, data = dr.download_version(ADMIN, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(filename, "archived.pdf")
+
+    def test_download_version_unchanged_for_viewer_on_active_doc(self):
+        filename, _, data = dr.download_version(VIEWER, self.active_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(filename, "active.pdf")
+
+    def test_restoring_document_restores_view_access(self):
+        dr.restore_document(ADMIN, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNotNone(detail)
+        filename, _, _ = dr.download_version(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(filename, "archived.pdf")
+
+    def test_denied_archived_access_does_not_change_error_message_shape(self):
+        # The denial must look exactly like any other category-access
+        # denial -- no wording that would let someone infer the
+        # document's archived status from the error alone.
+        try:
+            dr.get_document_detail(VIEWER, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+            self.fail("expected PermissionDenied")
+        except dr.PermissionDenied as e:
+            self.assertEqual(str(e), f"'{VIEWER}' is not allowed to get document detail.")
+
 
 # ---------------------------------------------------------------------------
 # Search / filters / pagination / blob isolation
@@ -856,6 +926,192 @@ class DuplicateDetectionTests(TempDbTestCase):
     def test_outsider_denied(self):
         with self.assertRaises(dr.PermissionDenied):
             dr.find_duplicate_by_sha256(OUTSIDER, self.category_id, self.sha256, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 read-only helper: is_admin_via_secret
+# ---------------------------------------------------------------------------
+class IsAdminViaSecretTests(unittest.TestCase):
+    def test_true_for_secret_listed_email(self):
+        self.assertTrue(dr.is_admin_via_secret(ADMIN, secrets_getter=admin_secrets()))
+
+    def test_false_for_non_secret_email(self):
+        self.assertFalse(dr.is_admin_via_secret(OUTSIDER, secrets_getter=admin_secrets()))
+
+    def test_false_for_doc_users_admin_not_in_secret(self):
+        # is_admin() would say True for a doc_users admin row even with
+        # no matching secret -- is_admin_via_secret() must say False,
+        # since it only ever looks at the secret.
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            dr.create_doc_user(ADMIN, "second-admin@example.test", dr.ROLE_ADMIN, db_path=path, secrets_getter=admin_secrets())
+            self.assertTrue(dr.is_admin("second-admin@example.test", db_path=path, secrets_getter=admin_secrets()))
+            self.assertFalse(dr.is_admin_via_secret("second-admin@example.test", secrets_getter=admin_secrets()))
+        finally:
+            os.remove(path)
+
+    def test_empty_actor_returns_false(self):
+        self.assertFalse(dr.is_admin_via_secret(""))
+
+    def test_never_raises_on_malformed_secret(self):
+        self.assertFalse(dr.is_admin_via_secret(ADMIN, secrets_getter=lambda: {"DOC_REPO_ADMIN_EMAILS": None}))
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 read-only helper: list_category_access
+# ---------------------------------------------------------------------------
+class ListCategoryAccessTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Access List", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_admin_sees_all_grants(self):
+        rows = dr.list_category_access(ADMIN, self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        subjects = {r["subject"]: r["level"] for r in rows}
+        self.assertEqual(subjects, {CONTRIBUTOR: dr.LEVEL_CONTRIBUTE, VIEWER: dr.LEVEL_VIEW})
+
+    def test_non_admin_denied(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.list_category_access(CONTRIBUTOR, self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_denial_is_audited(self):
+        before = len(audit_rows(self.db_path, "list_category_access_denied"))
+        with self.assertRaises(dr.PermissionDenied):
+            dr.list_category_access(VIEWER, self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "list_category_access_denied")), before + 1)
+
+    def test_successful_read_not_audited(self):
+        before = len(audit_rows(self.db_path))
+        dr.list_category_access(ADMIN, self.category_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path)), before)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 read-only helper: list_audit_log
+# ---------------------------------------------------------------------------
+class ListAuditLogTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Audit List", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_non_admin_denied(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.list_audit_log(CONTRIBUTOR, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_newest_first(self):
+        dr.create_category(ADMIN, "Second Category", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        rows = dr.list_audit_log(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertTrue(rows[0]["id"] > rows[1]["id"])
+
+    def test_filter_by_action_substring(self):
+        rows = dr.list_audit_log(ADMIN, action_filter="create_category", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertTrue(rows)
+        self.assertTrue(all("create_category" in r["action"] for r in rows))
+
+    def test_filter_by_actor(self):
+        rows = dr.list_audit_log(ADMIN, actor_filter=CONTRIBUTOR, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(rows, [])  # CONTRIBUTOR never performed a mutation yet
+        rows = dr.list_audit_log(ADMIN, actor_filter=ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertTrue(rows)
+
+    def test_action_filter_escapes_like_wildcards(self):
+        rows = dr.list_audit_log(ADMIN, action_filter="create%category", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(rows, [])  # literal "%" must not match "_" as a wildcard
+
+    def test_pagination(self):
+        for i in range(5):
+            dr.create_category(ADMIN, f"Pagination Cat {i}", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        page1 = dr.list_audit_log(ADMIN, page=1, page_size=2, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        page2 = dr.list_audit_log(ADMIN, page=2, page_size=2, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        self.assertNotEqual({r["id"] for r in page1}, {r["id"] for r in page2})
+
+    def test_reading_log_is_not_itself_audited(self):
+        before = len(audit_rows(self.db_path))
+        dr.list_audit_log(ADMIN, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path)), before)
+
+    # -----------------------------------------------------------------
+    # date_from/date_to: whole-calendar-day bounds, not a literal
+    # string comparison against ts (a full UTC timestamp). ts has no
+    # test-time injection point (unlike app.py's _test_clock for the
+    # tile-visibility cache) -- these insert synthetic doc_audit_log
+    # rows with explicit timestamps directly, same way other tests in
+    # this file reach into the database with a raw sqlite3 connection
+    # for setup/verification.
+    # -----------------------------------------------------------------
+    def _insert_audit_row(self, ts: str, action: str = "synthetic_test_action") -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO doc_audit_log (ts, actor_email, action) VALUES (?, ?, ?)",
+            (ts, ADMIN, action),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_date_from_includes_a_row_at_the_very_start_of_that_day(self):
+        self._insert_audit_row("2026-11-13T00:00:00+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_from="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(len(rows), 1)
+
+    def test_date_to_includes_a_row_at_any_time_on_that_day(self):
+        # This is the exact case the bug affected: a plain "ts <=
+        # date_to" excluded every row on date_to's own day, since any
+        # real timestamp like "2026-11-13T23:59:59+00:00" sorts AFTER
+        # the bare string "2026-11-13".
+        self._insert_audit_row("2026-11-13T23:59:59+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(len(rows), 1)
+
+    def test_date_to_includes_a_row_at_the_very_start_of_that_day_too(self):
+        self._insert_audit_row("2026-11-13T00:00:00+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(len(rows), 1)
+
+    def test_day_before_date_from_is_excluded(self):
+        self._insert_audit_row("2026-11-12T23:59:59+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_from="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(rows, [])
+
+    def test_day_after_date_to_is_excluded(self):
+        self._insert_audit_row("2026-11-14T00:00:00+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(rows, [])
+
+    def test_combined_from_and_to_same_day_includes_whole_day_only(self):
+        self._insert_audit_row("2026-11-12T23:59:59+00:00")  # before
+        self._insert_audit_row("2026-11-13T00:00:00+00:00")  # start of day -- in range
+        self._insert_audit_row("2026-11-13T23:59:59+00:00")  # end of day -- in range
+        self._insert_audit_row("2026-11-14T00:00:00+00:00")  # after
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_from="2026-11-13", date_to="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["ts"].startswith("2026-11-13") for r in rows))
 
 
 # ---------------------------------------------------------------------------

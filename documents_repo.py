@@ -69,7 +69,7 @@ import os
 import sqlite3
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -400,6 +400,25 @@ def is_admin(actor_email: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=N
             return bool(row and row[0] == ROLE_ADMIN and row[1])
         finally:
             conn.close()
+    except Exception:
+        return False
+
+
+def is_admin_via_secret(actor_email: str, secrets_getter=None) -> bool:
+    """Read-only, side-effect-free (Phase 4 addition): True only if
+    actor_email is listed in the DOC_REPO_ADMIN_EMAILS secret
+    specifically -- never touches doc_users or opens any connection.
+    Distinct from is_admin() (which also counts an active doc_users
+    admin row): used by the admin UI to warn that this particular
+    admin's access isn't editable there at all, since the secret isn't
+    something this app can read back or change -- only a doc_users row
+    is. Never raises; a malformed secret just means False.
+    """
+    try:
+        actor_email = _normalize_email(actor_email)
+        if not actor_email:
+            return False
+        return actor_email in _admin_emails_from_secret(secrets_getter)
     except Exception:
         return False
 
@@ -895,6 +914,25 @@ def revoke_category_access(actor_email: str, category_id: int, subject_email: st
         conn.close()
 
 
+def list_category_access(actor_email: str, category_id: int, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> list[dict]:
+    """Read-only (Phase 4 addition): every doc_category_access row
+    (subject + level) for category_id, admin only. No audit row for a
+    successful read -- a lookup, not a mutation -- but a denial is
+    audited like every other one in this module."""
+    actor_email = _require_actor(actor_email)
+    conn = get_conn(db_path)
+    _set_row_factory(conn)
+    try:
+        if not _is_admin(conn, actor_email, secrets_getter):
+            _deny(conn, actor_email, "list_category_access", category_id=category_id)
+        rows = conn.execute(
+            "SELECT * FROM doc_category_access WHERE category_id = ? ORDER BY subject", (category_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # doc_users
 # ---------------------------------------------------------------------------
@@ -1349,7 +1387,10 @@ def list_documents(
 def get_document_detail(actor_email: str, document_id: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> dict | None:
     """The document row plus its full version history (metadata only --
     never reads document_blobs). Requires at least view access on the
-    document's category. Returns None if no such document exists."""
+    document's category -- or manage access (or admin) if the document
+    is archived, the same rule list_documents() uses for archived
+    listings: view/contribute access only ever grants an active
+    document. Returns None if no such document exists."""
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
     _set_row_factory(conn)
@@ -1358,7 +1399,8 @@ def get_document_detail(actor_email: str, document_id: str, db_path: Path = DEFA
         if doc is None:
             return None
         category_id = doc["category_id"]
-        if not _authorized_for_category(conn, actor_email, category_id, LEVEL_VIEW, secrets_getter):
+        min_level = LEVEL_MANAGE if doc["status"] == STATUS_ARCHIVED else LEVEL_VIEW
+        if not _authorized_for_category(conn, actor_email, category_id, min_level, secrets_getter):
             _deny(conn, actor_email, "get_document_detail", document_id=document_id, category_id=category_id)
         versions = conn.execute(
             """SELECT id, version_no, filename, extension, mime_type, size_bytes, sha256,
@@ -1391,7 +1433,11 @@ def download_version(
     """Returns (filename, mime_type, data) for a version -- the current
     one if version_id is omitted. Viewers may only download the
     current version; downloading any other version needs contribute
-    (or manage/admin) access, same as uploading. Verifies the
+    (or manage/admin) access, same as uploading. If the document is
+    archived, any download (current or old version) instead requires
+    manage access (or admin) -- the same rule list_documents() and
+    get_document_detail() use for archived documents; view/contribute
+    access only ever grants an active document. Verifies the
     reassembled bytes' length and SHA-256 against what was recorded at
     upload time before returning them, raising StorageIntegrityError on
     a mismatch (e.g. an interrupted write left partial chunks)."""
@@ -1405,7 +1451,10 @@ def download_version(
         category_id = doc["category_id"]
         target_version_id = version_id or doc["current_version_id"]
         is_current = target_version_id == doc["current_version_id"]
-        min_level = LEVEL_VIEW if is_current else LEVEL_CONTRIBUTE
+        if doc["status"] == STATUS_ARCHIVED:
+            min_level = LEVEL_MANAGE
+        else:
+            min_level = LEVEL_VIEW if is_current else LEVEL_CONTRIBUTE
 
         if not _authorized_for_category(conn, actor_email, category_id, min_level, secrets_getter):
             _deny(conn, actor_email, "download_version", document_id=document_id, version_id=target_version_id, category_id=category_id)
@@ -1429,5 +1478,77 @@ def download_version(
         _audit(conn, actor_email, "download_version", document_id=document_id, version_id=target_version_id, category_id=category_id, detail=version["filename"])
         conn.commit()
         return version["filename"], version["mime_type"], data
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Audit log (read-only)
+# ---------------------------------------------------------------------------
+def list_audit_log(
+    actor_email: str,
+    actor_filter: str | None = None,
+    action_filter: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db_path: Path = DEFAULT_DB_PATH,
+    secrets_getter=None,
+) -> list[dict]:
+    """Read-only (Phase 4 addition): doc_audit_log rows, newest first,
+    admin only. actor_filter/action_filter are optional substring
+    matches (LIKE, with % and _ escaped so they're matched literally,
+    same as list_documents()'s search).
+
+    date_from/date_to are calendar-day bounds (e.g. "2026-11-13"),
+    both inclusive of every row anywhere in that whole day -- not a
+    literal string comparison against the bound you passed. ts itself
+    is stored as a full UTC timestamp (see _now()), e.g.
+    "2026-11-13T21:21:23+00:00": a bare date string like "2026-11-13"
+    is already a lexicographic prefix of every timestamp on that day,
+    so "ts >= date_from" alone already includes that whole day with no
+    further adjustment needed. The upper bound does need one: a plain
+    "ts <= date_to" would exclude every row on date_to's own day
+    (any real timestamp "2026-11-13T..." sorts AFTER the bare string
+    "2026-11-13"), so this instead compares "ts < date_to + 1 day",
+    which includes every moment of date_to's day and nothing from the
+    day after.
+
+    Reading the log is not itself audited -- same as browsing
+    documents via list_documents() isn't -- but a denial is, like
+    every other one in this module."""
+    actor_email = _require_actor(actor_email)
+    conn = get_conn(db_path)
+    _set_row_factory(conn)
+    try:
+        if not _is_admin(conn, actor_email, secrets_getter):
+            _deny(conn, actor_email, "list_audit_log")
+
+        clauses = []
+        params: list = []
+        if actor_filter and actor_filter.strip():
+            clauses.append("actor_email LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(actor_filter.strip())}%")
+        if action_filter and action_filter.strip():
+            clauses.append("action LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(action_filter.strip())}%")
+        if date_from:
+            clauses.append("ts >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("ts < ?")
+            params.append((date.fromisoformat(date_to) + timedelta(days=1)).isoformat())
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        page = max(page, 1)
+        page_size = max(page_size, 1)
+        offset = (page - 1) * page_size
+
+        rows = conn.execute(
+            f"SELECT * FROM doc_audit_log {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*params, page_size, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

@@ -70,6 +70,29 @@ def _meets_level(level: str | None, minimum: str) -> bool:
         return False
 
 
+# Display labels for the Admin tab's role dropdowns -- the module's own
+# role values (documents_repo.ROLE_ADMIN etc.) are the actual stored
+# strings; these are only what's shown on screen.
+_ROLE_LABELS = {
+    documents_repo.ROLE_ADMIN: "Administrator",
+    documents_repo.ROLE_CONTRIBUTOR: "Authorized Contributor",
+    documents_repo.ROLE_VIEWER: "Viewer",
+}
+_ROLE_VALUES_BY_LABEL = {label: value for value, label in _ROLE_LABELS.items()}
+
+_ACCESS_LEVELS = [documents_repo.LEVEL_VIEW, documents_repo.LEVEL_CONTRIBUTE, documents_repo.LEVEL_MANAGE]
+
+
+def _is_valid_email_format(email: str) -> bool:
+    """Minimal UI-side sanity check before even attempting
+    create_doc_user()/grant_category_access() -- not the real
+    validation (those functions' own blank/duplicate checks are), just
+    a friendlier message than a generic failure for an obviously
+    malformed address."""
+    email = (email or "").strip()
+    return "@" in email and "." in email.rsplit("@", 1)[-1]
+
+
 # ---------------------------------------------------------------------------
 # Small display helpers
 # ---------------------------------------------------------------------------
@@ -290,13 +313,14 @@ def render_document_repository(actor_email: str) -> None:
         manageable = []
     can_show_archived_toggle = is_admin or bool(manageable)
 
+    tab_names = ["Browse"]
     if contributable:
-        tab_browse, tab_upload = st.tabs(["Browse", "Upload"])
-    else:
-        (tab_browse,) = st.tabs(["Browse"])
-        tab_upload = None
+        tab_names.append("Upload")
+    if is_admin:
+        tab_names.append("Admin")
+    tabs = dict(zip(tab_names, st.tabs(tab_names)))
 
-    with tab_browse:
+    with tabs["Browse"]:
         col_left, col_main = st.columns([1, 3])
 
         with col_left:
@@ -310,9 +334,13 @@ def render_document_repository(actor_email: str) -> None:
         st.divider()
         _render_detail_panel(actor_email, docs, categories_by_id, is_admin, secrets_getter)
 
-    if tab_upload is not None:
-        with tab_upload:
+    if "Upload" in tabs:
+        with tabs["Upload"]:
             _render_upload_tab(actor_email, contributable, secrets_getter)
+
+    if "Admin" in tabs:
+        with tabs["Admin"]:
+            _render_admin_tab(actor_email, secrets_getter)
 
 
 # ---------------------------------------------------------------------------
@@ -774,3 +802,423 @@ def _render_upload_tab(actor_email: str, contributable_categories: list[dict], s
                     st.success(message)
             else:
                 st.error(f"'{filename}' failed: {_escape_markdown(r['error'])}")
+
+
+# ---------------------------------------------------------------------------
+# Admin tab -- shown only when documents_repo.is_admin(actor_email) is
+# true (checked in render_document_repository() before this tab even
+# exists). Every mutation below still goes through documents_repo.py's
+# own admin-gated service functions, which re-check authorization
+# themselves regardless of this tab's own visibility -- the tab is a
+# convenience, not the security boundary.
+# ---------------------------------------------------------------------------
+def _run_admin_action(action, *args, success_message: str = "Done.", **kwargs) -> None:
+    """Calls an admin-gated documents_repo mutation, showing a toast and
+    rerunning on success, or a clear error on failure (PermissionDenied/
+    ValueError show their own message; anything else gets a generic
+    one). Factored out because the Admin tab below has a lot of
+    buttons that all follow this exact shape."""
+    try:
+        action(*args, **kwargs)
+        st.toast(success_message)
+        st.rerun()
+    except documents_repo.PermissionDenied as e:
+        st.error(_escape_markdown(str(e)))
+    except ValueError as e:
+        st.error(_escape_markdown(str(e)))
+    except Exception:
+        st.error("Couldn't complete this action right now.")
+
+
+def _render_admin_tab(actor_email: str, secrets_getter) -> None:
+    sub_names = ["Categories", "Users & Roles", "Access Grants", "Archived Records", "Audit Log"]
+    subs = dict(zip(sub_names, st.tabs(sub_names)))
+    with subs["Categories"]:
+        _render_admin_categories(actor_email, secrets_getter)
+    with subs["Users & Roles"]:
+        _render_admin_users(actor_email, secrets_getter)
+    with subs["Access Grants"]:
+        _render_admin_access_grants(actor_email, secrets_getter)
+    with subs["Archived Records"]:
+        _render_admin_archived_records(actor_email, secrets_getter)
+    with subs["Audit Log"]:
+        _render_admin_audit_log(actor_email, secrets_getter)
+
+
+# ---------------------------------------------------------------------------
+# Admin: Categories (create, rename, reorder, deactivate/reactivate)
+# ---------------------------------------------------------------------------
+def _move_category(actor_email: str, ordered_categories: list[dict], from_index: int, to_index: int, secrets_getter) -> None:
+    ids = [c["id"] for c in ordered_categories]
+    ids[from_index], ids[to_index] = ids[to_index], ids[from_index]
+    _run_admin_action(documents_repo.reorder_categories, actor_email, ids, secrets_getter=secrets_getter, success_message="Reordered.")
+
+
+def _render_admin_categories(actor_email: str, secrets_getter) -> None:
+    try:
+        categories = documents_repo.list_categories(actor_email, secrets_getter=secrets_getter)
+    except documents_repo.PermissionDenied as e:
+        st.error(_escape_markdown(str(e)))
+        return
+    except Exception:
+        st.error("Couldn't load categories right now.")
+        return
+    categories = sorted(categories, key=lambda c: c["sort_order"])
+
+    with st.container(border=True):
+        st.markdown("**Create category**")
+        new_name = st.text_input("Name", key="doc_repo_admin_new_category_name")
+        new_description = st.text_input("Description (optional)", key="doc_repo_admin_new_category_description")
+        if st.button("Create category", key="doc_repo_admin_create_category_btn"):
+            _run_admin_action(
+                documents_repo.create_category, actor_email, new_name,
+                description=new_description, secrets_getter=secrets_getter,
+                success_message="Category created.",
+            )
+
+    st.markdown("**Existing categories**")
+    if not categories:
+        st.caption("No categories yet.")
+        return
+
+    for i, cat in enumerate(categories):
+        with st.container(border=True):
+            status_label = "Active" if cat["is_active"] else "Inactive"
+            st.write(f"**{_escape_markdown(cat['name'])}** ({status_label})")
+            if cat.get("description"):
+                st.caption(_escape_markdown(cat["description"]))
+
+            col_rename, col_up, col_down, col_status = st.columns([3, 1, 1, 2])
+            with col_rename:
+                rename_key = f"doc_repo_admin_cat_rename_input::{cat['id']}"
+                new_cat_name = st.text_input(
+                    "Rename to", value=cat["name"], key=rename_key, label_visibility="collapsed",
+                )
+                if st.button(
+                    "Save name", key=f"doc_repo_admin_cat_rename_btn::{cat['id']}",
+                    disabled=(new_cat_name == cat["name"]),
+                ):
+                    _run_admin_action(
+                        documents_repo.rename_category, actor_email, cat["id"], new_cat_name,
+                        secrets_getter=secrets_getter, success_message="Renamed.",
+                    )
+            with col_up:
+                if st.button("↑ Up", key=f"doc_repo_admin_cat_up::{cat['id']}", disabled=(i == 0)):
+                    _move_category(actor_email, categories, i, i - 1, secrets_getter)
+            with col_down:
+                if st.button("↓ Down", key=f"doc_repo_admin_cat_down::{cat['id']}", disabled=(i == len(categories) - 1)):
+                    _move_category(actor_email, categories, i, i + 1, secrets_getter)
+            with col_status:
+                if cat["is_active"]:
+                    if st.button("Deactivate", key=f"doc_repo_admin_cat_deactivate_btn::{cat['id']}"):
+                        _run_admin_action(
+                            documents_repo.deactivate_category, actor_email, cat["id"],
+                            secrets_getter=secrets_getter, success_message="Deactivated.",
+                        )
+                else:
+                    if st.button("Reactivate", key=f"doc_repo_admin_cat_reactivate_btn::{cat['id']}"):
+                        _run_admin_action(
+                            documents_repo.reactivate_category, actor_email, cat["id"],
+                            secrets_getter=secrets_getter, success_message="Reactivated.",
+                        )
+
+
+# ---------------------------------------------------------------------------
+# Admin: Users & Roles
+# ---------------------------------------------------------------------------
+def _render_admin_users(actor_email: str, secrets_getter) -> None:
+    try:
+        users = documents_repo.list_doc_users(actor_email, secrets_getter=secrets_getter)
+    except documents_repo.PermissionDenied as e:
+        st.error(_escape_markdown(str(e)))
+        return
+    except Exception:
+        st.error("Couldn't load users right now.")
+        return
+
+    with st.container(border=True):
+        st.markdown("**Add user**")
+        new_email = st.text_input("Email", key="doc_repo_admin_new_user_email")
+        new_role_label = st.selectbox("Role", list(_ROLE_LABELS.values()), key="doc_repo_admin_new_user_role")
+        if st.button("Add user", key="doc_repo_admin_add_user_btn"):
+            candidate = (new_email or "").strip().lower()
+            if not _is_valid_email_format(candidate):
+                st.error("That doesn't look like a valid email address.")
+            else:
+                _run_admin_action(
+                    documents_repo.create_doc_user, actor_email, candidate, _ROLE_VALUES_BY_LABEL[new_role_label],
+                    secrets_getter=secrets_getter, success_message="User added.",
+                )
+
+    st.markdown("**Existing users**")
+    if not users:
+        st.caption("No users yet.")
+        return
+
+    for u in users:
+        email = u["email"]
+        is_self = (email == actor_email)
+        try:
+            is_secret_admin = documents_repo.is_admin_via_secret(email, secrets_getter=secrets_getter)
+        except Exception:
+            is_secret_admin = False
+        # Blocks a self-targeted change only when it would actually
+        # strip this exact admin's only path to admin access -- not a
+        # security boundary (documents_repo.py's own admin check on
+        # every call is), just a guard against an easy-to-regret click.
+        would_self_lockout = (
+            is_self and not is_secret_admin
+            and u["role"] == documents_repo.ROLE_ADMIN and u["is_active"]
+        )
+
+        with st.container(border=True):
+            label = f"**{_escape_markdown(email)}**"
+            if is_secret_admin:
+                label += " _(also admin via the DOC\\_REPO\\_ADMIN\\_EMAILS secret)_"
+            st.write(label)
+            st.caption(f"Role: {_ROLE_LABELS.get(u['role'], u['role'])} -- {'Active' if u['is_active'] else 'Inactive'}")
+            if is_secret_admin:
+                st.caption(
+                    "This email's admin access comes from the DOC_REPO_ADMIN_EMAILS secret and "
+                    "can't be changed here -- the role/status below only affects its doc_users "
+                    "row, which has no effect on that secret-based access."
+                )
+
+            col_role, col_status = st.columns(2)
+            with col_role:
+                role_options = list(_ROLE_LABELS.values())
+                current_label = _ROLE_LABELS.get(u["role"], role_options[0])
+                new_label = st.selectbox(
+                    "Role", role_options,
+                    index=role_options.index(current_label),
+                    key=f"doc_repo_admin_user_role::{email}",
+                )
+                new_role_value = _ROLE_VALUES_BY_LABEL[new_label]
+                blocks_role_change = would_self_lockout and new_role_value != documents_repo.ROLE_ADMIN
+                if st.button(
+                    "Update role", key=f"doc_repo_admin_user_update_role_btn::{email}",
+                    disabled=(new_role_value == u["role"] or blocks_role_change),
+                ):
+                    _run_admin_action(
+                        documents_repo.update_doc_user_role, actor_email, email, new_role_value,
+                        secrets_getter=secrets_getter, success_message="Role updated.",
+                    )
+                if blocks_role_change:
+                    st.caption("You can't remove your own admin access this way -- have another admin do it.")
+            with col_status:
+                if u["is_active"]:
+                    if st.button(
+                        "Deactivate", key=f"doc_repo_admin_user_deactivate_btn::{email}",
+                        disabled=would_self_lockout,
+                    ):
+                        _run_admin_action(
+                            documents_repo.deactivate_doc_user, actor_email, email,
+                            secrets_getter=secrets_getter, success_message="Deactivated.",
+                        )
+                    if would_self_lockout:
+                        st.caption("You can't deactivate your own only admin access this way.")
+                else:
+                    if st.button("Reactivate", key=f"doc_repo_admin_user_reactivate_btn::{email}"):
+                        _run_admin_action(
+                            documents_repo.reactivate_doc_user, actor_email, email,
+                            secrets_getter=secrets_getter, success_message="Reactivated.",
+                        )
+
+
+# ---------------------------------------------------------------------------
+# Admin: per-category access grants
+# ---------------------------------------------------------------------------
+def _render_admin_access_grants(actor_email: str, secrets_getter) -> None:
+    try:
+        categories = documents_repo.list_categories(actor_email, secrets_getter=secrets_getter)
+    except Exception:
+        st.error("Couldn't load categories right now.")
+        return
+    if not categories:
+        st.caption("No categories yet -- create one in the Categories tab first.")
+        return
+
+    category_options = {c["id"]: c["name"] for c in categories}
+    selected_category_id = st.selectbox(
+        "Category", list(category_options), format_func=lambda cid: category_options[cid],
+        key="doc_repo_admin_access_category",
+    )
+
+    try:
+        grants = documents_repo.list_category_access(actor_email, selected_category_id, secrets_getter=secrets_getter)
+    except documents_repo.PermissionDenied as e:
+        st.error(_escape_markdown(str(e)))
+        return
+    except Exception:
+        st.error("Couldn't load access grants right now.")
+        return
+
+    with st.container(border=True):
+        st.markdown("**Grant or change access**")
+        grant_email = st.text_input("User email", key="doc_repo_admin_grant_email")
+        grant_level = st.selectbox("Level", _ACCESS_LEVELS, key="doc_repo_admin_grant_level")
+        if st.button("Grant / update access", key="doc_repo_admin_grant_btn"):
+            candidate = (grant_email or "").strip().lower()
+            if not _is_valid_email_format(candidate):
+                st.error("That doesn't look like a valid email address.")
+            else:
+                _run_admin_action(
+                    documents_repo.grant_category_access, actor_email, selected_category_id, candidate, grant_level,
+                    secrets_getter=secrets_getter, success_message="Access granted.",
+                )
+
+    st.markdown("**Current access**")
+    if not grants:
+        st.caption("No one has explicit access to this category yet.")
+        return
+
+    for g in grants:
+        with st.container(border=True):
+            st.write(f"**{_escape_markdown(g['subject'])}** -- {g['level']}")
+            col_change, col_revoke = st.columns(2)
+            with col_change:
+                new_level = st.selectbox(
+                    "Change level", _ACCESS_LEVELS, index=_ACCESS_LEVELS.index(g["level"]),
+                    key=f"doc_repo_admin_access_level::{g['id']}",
+                )
+                if st.button(
+                    "Save level", key=f"doc_repo_admin_access_save_btn::{g['id']}",
+                    disabled=(new_level == g["level"]),
+                ):
+                    _run_admin_action(
+                        documents_repo.grant_category_access, actor_email, selected_category_id, g["subject"], new_level,
+                        secrets_getter=secrets_getter, success_message="Access level updated.",
+                    )
+            with col_revoke:
+                if st.button("Revoke", key=f"doc_repo_admin_access_revoke_btn::{g['id']}"):
+                    _run_admin_action(
+                        documents_repo.revoke_category_access, actor_email, selected_category_id, g["subject"],
+                        secrets_getter=secrets_getter, success_message="Access revoked.",
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Admin: archived records, across every category
+# ---------------------------------------------------------------------------
+def _render_admin_archived_records(actor_email: str, secrets_getter) -> None:
+    try:
+        categories = documents_repo.list_categories(actor_email, secrets_getter=secrets_getter)
+    except Exception:
+        categories = []
+    categories_by_id = {c["id"]: c for c in categories}
+
+    page = st.session_state.get("_doc_repo_admin_archived_page", 1)
+    try:
+        with st.spinner("Loading archived documents..."):
+            docs = documents_repo.list_documents(
+                actor_email, status=documents_repo.STATUS_ARCHIVED, page=page, page_size=PAGE_SIZE,
+                secrets_getter=secrets_getter,
+            )
+    except documents_repo.PermissionDenied as e:
+        st.error(_escape_markdown(str(e)))
+        return
+    except Exception:
+        st.error("Couldn't load archived documents right now.")
+        return
+
+    if not docs:
+        st.info("No archived documents.")
+        return
+
+    for d in docs:
+        with st.container(border=True):
+            category_name = categories_by_id.get(d["category_id"], {}).get("name", "—")
+            st.write(f"**{_escape_markdown(d['title'])}** -- {_escape_markdown(category_name)}")
+            st.caption(
+                f"{_escape_markdown(d.get('current_filename') or '—')} -- "
+                f"archived {_format_timestamp(d.get('archived_at'))} by {_escape_markdown(d.get('archived_by') or '—')}"
+            )
+            if st.button("Restore", key=f"doc_repo_admin_restore_btn::{d['id']}"):
+                _run_admin_action(
+                    documents_repo.restore_document, actor_email, d["id"],
+                    secrets_getter=secrets_getter, success_message="Restored.",
+                )
+
+    col_prev, col_label, col_next = st.columns([1, 2, 1])
+    with col_prev:
+        if st.button("◀ Previous", key="doc_repo_admin_archived_prev_btn", disabled=(page <= 1)):
+            st.session_state["_doc_repo_admin_archived_page"] = page - 1
+            st.rerun()
+    with col_label:
+        st.caption(f"Page {page}")
+    with col_next:
+        if st.button("Next ▶", key="doc_repo_admin_archived_next_btn", disabled=(len(docs) < PAGE_SIZE)):
+            st.session_state["_doc_repo_admin_archived_page"] = page + 1
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Admin: audit log viewer (read-only, newest first, paginated, filterable)
+# ---------------------------------------------------------------------------
+def _render_admin_audit_log(actor_email: str, secrets_getter) -> None:
+    col_actor, col_action, col_from, col_to = st.columns(4)
+    with col_actor:
+        actor_filter = st.text_input("Actor contains", key="doc_repo_admin_audit_actor_filter")
+    with col_action:
+        action_filter = st.text_input("Action contains", key="doc_repo_admin_audit_action_filter")
+    with col_from:
+        date_from = st.date_input("From", value=None, key="doc_repo_admin_audit_date_from")
+    with col_to:
+        date_to = st.date_input("To", value=None, key="doc_repo_admin_audit_date_to")
+
+    date_from_value = date_from.isoformat() if date_from else None
+    date_to_value = date_to.isoformat() if date_to else None
+
+    filter_signature = (actor_filter, action_filter, date_from_value, date_to_value)
+    if st.session_state.get("_doc_repo_admin_audit_last_filter_sig") != filter_signature:
+        st.session_state["_doc_repo_admin_audit_page"] = 1
+        st.session_state["_doc_repo_admin_audit_last_filter_sig"] = filter_signature
+    page = st.session_state.get("_doc_repo_admin_audit_page", 1)
+
+    try:
+        with st.spinner("Loading audit log..."):
+            rows = documents_repo.list_audit_log(
+                actor_email, actor_filter=actor_filter or None, action_filter=action_filter or None,
+                date_from=date_from_value, date_to=date_to_value,
+                page=page, page_size=PAGE_SIZE, secrets_getter=secrets_getter,
+            )
+    except documents_repo.PermissionDenied as e:
+        st.error(_escape_markdown(str(e)))
+        return
+    except Exception:
+        st.error("Couldn't load the audit log right now.")
+        return
+
+    if not rows:
+        st.info("No audit log entries match these filters.")
+        return
+
+    # st.dataframe cells are always plain text (confirmed: no Markdown
+    # rendering there, unlike nearly everything else in this module) --
+    # so, unlike elsewhere, these are deliberately NOT passed through
+    # _escape_markdown(): doing so would just show a literal stray
+    # backslash for no protective benefit.
+    table_rows = [
+        {
+            "Time": _format_timestamp(r.get("ts")),
+            "Actor": r.get("actor_email") or "—",
+            "Action": r.get("action") or "—",
+            "Document": r.get("document_id") or "—",
+            "Category": r.get("category_id") if r.get("category_id") is not None else "—",
+            "Detail": r.get("detail") or "—",
+        }
+        for r in rows
+    ]
+    st.dataframe(table_rows, hide_index=True, width="stretch")
+
+    col_prev, col_label, col_next = st.columns([1, 2, 1])
+    with col_prev:
+        if st.button("◀ Previous", key="doc_repo_admin_audit_prev_btn", disabled=(page <= 1)):
+            st.session_state["_doc_repo_admin_audit_page"] = page - 1
+            st.rerun()
+    with col_label:
+        st.caption(f"Page {page}")
+    with col_next:
+        if st.button("Next ▶", key="doc_repo_admin_audit_next_btn", disabled=(len(rows) < PAGE_SIZE)):
+            st.session_state["_doc_repo_admin_audit_page"] = page + 1
+            st.rerun()

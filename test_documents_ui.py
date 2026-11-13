@@ -72,6 +72,7 @@ import sqlite3
 import sys
 import unittest
 import zipfile
+from datetime import date
 from unittest import mock
 
 import documents_repo
@@ -531,9 +532,13 @@ class DocumentRepositoryUITests(unittest.TestCase):
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
         self.assertFalse(at.exception)
-        self.assertEqual(len(at.dataframe), 1)
-        titles = at.dataframe[0].value["Title"].tolist()
-        self.assertIn("Blob Isolation Doc", titles)
+        # The Admin tab's own tables (e.g. the audit log) also render
+        # unconditionally for an admin -- not just the Browse tab's
+        # document table -- so this looks for the Browse table's
+        # content among whichever dataframes exist, rather than
+        # asserting there is exactly one on the whole page.
+        all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
+        self.assertIn("Blob Isolation Doc", all_titles)
 
     def test_prepare_download_then_download_button_appears(self):
         cat_id = documents_repo.create_category(ADMIN_EMAIL, "Download Test", secrets_getter=admin_secrets_getter)
@@ -571,7 +576,10 @@ class DocumentRepositoryUITests(unittest.TestCase):
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
         self.assertFalse(at.exception)
-        self.assertEqual([t.label for t in at.tabs], ["Browse", "Upload"])
+        # An admin also gets the Admin tab (and its sub-tabs, which
+        # at.tabs flattens in alongside the top-level ones) -- see the
+        # dedicated Admin-tab tests for that; this only checks Upload.
+        self.assertIn("Upload", [t.label for t in at.tabs])
 
     def test_upload_tab_visible_for_contributor(self):
         cat_id = documents_repo.create_category(ADMIN_EMAIL, "Contributor Cat", secrets_getter=admin_secrets_getter)
@@ -908,6 +916,383 @@ class DocumentRepositoryUITests(unittest.TestCase):
             at.selectbox(key="doc_repo_upload_category").set_value(cat_b).run(timeout=30)
             self.assertFalse(at.exception)
             self.assertEqual(mocked.call_count, 2)  # category changed -- recomputed
+
+    # -----------------------------------------------------------------
+    # Admin tab: visibility
+    # -----------------------------------------------------------------
+    def test_admin_tab_hidden_for_viewer(self):
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertNotIn("Admin", [t.label for t in at.tabs])
+
+    def test_admin_tab_hidden_for_contributor(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Contrib Only", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, CONTRIBUTOR_EMAIL, documents_repo.LEVEL_CONTRIBUTE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, CONTRIBUTOR_EMAIL, documents_repo.ROLE_CONTRIBUTOR, secrets_getter=admin_secrets_getter)
+        at = self._at_as(CONTRIBUTOR_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertNotIn("Admin", [t.label for t in at.tabs])
+
+    def test_admin_tab_hidden_even_with_manage_level_access(self):
+        # Manage-level access unlocks the "Show archived" toggle, but
+        # it is not adminship -- the Admin tab must still be absent.
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Manage Only", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertNotIn("Admin", [t.label for t in at.tabs])
+
+    def test_admin_tab_absent_for_non_admin_even_with_forced_session_state(self):
+        # There is no session_state flag anywhere in this module that
+        # gates the Admin tab's visibility -- it is decided fresh, every
+        # run, from documents_repo.is_admin(). Forcing plausible-looking
+        # state before the run must have no effect.
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
+        at.secrets["DOC_REPO_ENABLED"] = "true"
+        at.session_state["_test_actor_email"] = VIEWER_EMAIL
+        at.session_state["_doc_repo_admin_view"] = True
+        at.session_state["_doc_repo_is_admin_override"] = True
+        at.session_state["is_admin"] = True
+        at.run(timeout=30)
+        at.button(key="select_Document Repository").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertNotIn("Admin", [t.label for t in at.tabs])
+
+    def test_admin_tab_and_subtabs_visible_for_admin(self):
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        labels = [t.label for t in at.tabs]
+        self.assertIn("Admin", labels)
+        for sub in ("Categories", "Users & Roles", "Access Grants", "Archived Records", "Audit Log"):
+            self.assertIn(sub, labels)
+
+    # -----------------------------------------------------------------
+    # Admin tab: non-admin denied at the service level regardless of UI
+    # -----------------------------------------------------------------
+    def test_non_admin_cannot_call_admin_functions_directly(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Service Gate", secrets_getter=admin_secrets_getter)
+        calls = [
+            lambda: documents_repo.create_category(VIEWER_EMAIL, "x", secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.rename_category(VIEWER_EMAIL, cat_id, "x", secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.reorder_categories(VIEWER_EMAIL, [cat_id], secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.deactivate_category(VIEWER_EMAIL, cat_id, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.reactivate_category(VIEWER_EMAIL, cat_id, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.create_doc_user(VIEWER_EMAIL, "x@example.test", documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.update_doc_user_role(VIEWER_EMAIL, ADMIN_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.deactivate_doc_user(VIEWER_EMAIL, ADMIN_EMAIL, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.reactivate_doc_user(VIEWER_EMAIL, ADMIN_EMAIL, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.grant_category_access(VIEWER_EMAIL, cat_id, "x@example.test", documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.revoke_category_access(VIEWER_EMAIL, cat_id, "x@example.test", secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.list_doc_users(VIEWER_EMAIL, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.list_category_access(VIEWER_EMAIL, cat_id, secrets_getter=admin_secrets_getter),
+            lambda: documents_repo.list_audit_log(VIEWER_EMAIL, secrets_getter=admin_secrets_getter),
+        ]
+        for call in calls:
+            with self.assertRaises(documents_repo.PermissionDenied):
+                call()
+
+    # -----------------------------------------------------------------
+    # Admin tab: Categories (create/rename/reorder/deactivate/reactivate)
+    # -----------------------------------------------------------------
+    def test_admin_create_category_via_ui(self):
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.text_input(key="doc_repo_admin_new_category_name").set_value("Brand New Category").run(timeout=30)
+        at.button(key="doc_repo_admin_create_category_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        names = {c["name"] for c in documents_repo.list_categories(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertIn("Brand New Category", names)
+
+    def test_admin_create_category_duplicate_name_rejected(self):
+        documents_repo.create_category(ADMIN_EMAIL, "Dup Cat", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.text_input(key="doc_repo_admin_new_category_name").set_value("Dup Cat").run(timeout=30)
+        at.button(key="doc_repo_admin_create_category_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertTrue(any("already exists" in e.value for e in at.error))
+
+    def test_admin_create_category_blank_name_rejected(self):
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.button(key="doc_repo_admin_create_category_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertTrue(len(at.error) > 0)
+
+    def test_admin_rename_category_via_ui(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Old Name", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.text_input(key=f"doc_repo_admin_cat_rename_input::{cat_id}").set_value("New Name").run(timeout=30)
+        at.button(key=f"doc_repo_admin_cat_rename_btn::{cat_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        cats = {c["id"]: c["name"] for c in documents_repo.list_categories(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertEqual(cats[cat_id], "New Name")
+
+    def test_admin_reorder_categories_move_up(self):
+        cat_a = documents_repo.create_category(ADMIN_EMAIL, "Order A", secrets_getter=admin_secrets_getter)
+        cat_b = documents_repo.create_category(ADMIN_EMAIL, "Order B", secrets_getter=admin_secrets_getter)
+        before = [c["id"] for c in sorted(
+            documents_repo.list_categories(ADMIN_EMAIL, secrets_getter=admin_secrets_getter),
+            key=lambda c: c["sort_order"],
+        )]
+        self.assertEqual(before.index(cat_a), before.index(cat_b) - 1)  # A immediately before B
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.button(key=f"doc_repo_admin_cat_up::{cat_b}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        after = [c["id"] for c in sorted(
+            documents_repo.list_categories(ADMIN_EMAIL, secrets_getter=admin_secrets_getter),
+            key=lambda c: c["sort_order"],
+        )]
+        self.assertEqual(after.index(cat_b), after.index(cat_a) - 1)  # B now immediately before A
+
+    def test_admin_deactivate_category_hides_it_but_keeps_documents(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Deactivate Me", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Surviving Doc", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.button(key=f"doc_repo_admin_cat_deactivate_btn::{cat_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        cats = {c["id"]: c for c in documents_repo.list_categories(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertFalse(cats[cat_id]["is_active"])
+        # Hidden from the non-admin viewer who had view access on it...
+        self.assertEqual(documents_repo.list_categories(VIEWER_EMAIL, secrets_getter=admin_secrets_getter), [])
+        # ...but the document itself is untouched, not deleted.
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["title"], "Surviving Doc")
+
+        # Reactivating brings the category (and the document with it)
+        # back into view for that same viewer.
+        at.button(key=f"doc_repo_admin_cat_reactivate_btn::{cat_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(documents_repo.list_categories(VIEWER_EMAIL, secrets_getter=admin_secrets_getter)), 1)
+        docs = documents_repo.list_documents(VIEWER_EMAIL, category_id=cat_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual([d["id"] for d in docs], [doc_id])
+
+    # -----------------------------------------------------------------
+    # Admin tab: Users & Roles
+    # -----------------------------------------------------------------
+    def test_admin_add_user_via_ui(self):
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.text_input(key="doc_repo_admin_new_user_email").set_value("New.User@Example.test").run(timeout=30)
+        at.selectbox(key="doc_repo_admin_new_user_role").set_value("Authorized Contributor").run(timeout=30)
+        at.button(key="doc_repo_admin_add_user_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        users = {u["email"]: u for u in documents_repo.list_doc_users(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertIn("new.user@example.test", users)  # lowercased
+        self.assertEqual(users["new.user@example.test"]["role"], documents_repo.ROLE_CONTRIBUTOR)
+
+    def test_admin_add_user_invalid_email_rejected(self):
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.text_input(key="doc_repo_admin_new_user_email").set_value("not-an-email").run(timeout=30)
+        at.button(key="doc_repo_admin_add_user_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertTrue(any("valid email" in e.value for e in at.error))
+        self.assertEqual(documents_repo.list_doc_users(ADMIN_EMAIL, secrets_getter=admin_secrets_getter), [])
+
+    def test_admin_change_user_role_via_ui(self):
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key=f"doc_repo_admin_user_role::{VIEWER_EMAIL}").set_value("Authorized Contributor").run(timeout=30)
+        at.button(key=f"doc_repo_admin_user_update_role_btn::{VIEWER_EMAIL}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        users = {u["email"]: u for u in documents_repo.list_doc_users(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertEqual(users[VIEWER_EMAIL]["role"], documents_repo.ROLE_CONTRIBUTOR)
+
+    def test_admin_deactivate_and_reactivate_user_via_ui(self):
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.button(key=f"doc_repo_admin_user_deactivate_btn::{VIEWER_EMAIL}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        users = {u["email"]: u for u in documents_repo.list_doc_users(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertFalse(users[VIEWER_EMAIL]["is_active"])
+
+        at.button(key=f"doc_repo_admin_user_reactivate_btn::{VIEWER_EMAIL}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        users = {u["email"]: u for u in documents_repo.list_doc_users(ADMIN_EMAIL, secrets_getter=admin_secrets_getter)}
+        self.assertTrue(users[VIEWER_EMAIL]["is_active"])
+
+    def test_admin_cannot_deactivate_own_only_admin_access(self):
+        # ADMIN_EMAIL here is a doc_users admin row with NO matching
+        # secret entry -- deactivating/role-changing it away from admin
+        # would strip their only path to admin access.
+        no_secret_admin = "doc-users-admin@example.test"
+        documents_repo.create_doc_user(ADMIN_EMAIL, no_secret_admin, documents_repo.ROLE_ADMIN, secrets_getter=admin_secrets_getter)
+
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL  # no_secret_admin is NOT in the secret
+        at.session_state["_test_actor_email"] = no_secret_admin
+        at.run(timeout=30)
+        at.button(key="select_Document Repository").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        deactivate_btn = next(b for b in at.button if b.key == f"doc_repo_admin_user_deactivate_btn::{no_secret_admin}")
+        self.assertTrue(deactivate_btn.disabled)
+
+        role_select = at.selectbox(key=f"doc_repo_admin_user_role::{no_secret_admin}")
+        role_select.set_value("Viewer").run(timeout=30)
+        update_btn = next(b for b in at.button if b.key == f"doc_repo_admin_user_update_role_btn::{no_secret_admin}")
+        self.assertTrue(update_btn.disabled)
+
+        # The backend itself still allows it (UI gating is convenience
+        # only) -- confirming this is a UI guard, not the real boundary.
+        documents_repo.deactivate_doc_user(no_secret_admin, no_secret_admin, secrets_getter=lambda: {"DOC_REPO_ADMIN_EMAILS": ADMIN_EMAIL})
+        self.assertFalse(documents_repo.is_admin(no_secret_admin, secrets_getter=lambda: {"DOC_REPO_ADMIN_EMAILS": ADMIN_EMAIL}))
+
+    def test_secret_based_admin_self_deactivate_not_blocked_and_shows_note(self):
+        # ADMIN_EMAIL is admin via the secret -- changing their doc_users
+        # row (if they even have one) can never remove that, so the UI
+        # must not block it, and should say so.
+        documents_repo.create_doc_user(ADMIN_EMAIL, ADMIN_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+
+        deactivate_btn = next(b for b in at.button if b.key == f"doc_repo_admin_user_deactivate_btn::{ADMIN_EMAIL}")
+        self.assertFalse(deactivate_btn.disabled)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("DOC_REPO_ADMIN_EMAILS secret", captions)
+
+    # -----------------------------------------------------------------
+    # Admin tab: per-category access grants
+    # -----------------------------------------------------------------
+    def test_admin_grant_change_and_revoke_access_via_ui(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Grant Flow", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+
+        at.selectbox(key="doc_repo_admin_access_category").set_value(cat_id).run(timeout=30)
+        at.text_input(key="doc_repo_admin_grant_email").set_value(VIEWER_EMAIL).run(timeout=30)
+        at.selectbox(key="doc_repo_admin_grant_level").set_value(documents_repo.LEVEL_VIEW).run(timeout=30)
+        at.button(key="doc_repo_admin_grant_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        grants = {g["subject"]: g["level"] for g in documents_repo.list_category_access(ADMIN_EMAIL, cat_id, secrets_getter=admin_secrets_getter)}
+        self.assertEqual(grants[VIEWER_EMAIL], documents_repo.LEVEL_VIEW)
+
+        grant_row = documents_repo.list_category_access(ADMIN_EMAIL, cat_id, secrets_getter=admin_secrets_getter)[0]
+        at.selectbox(key=f"doc_repo_admin_access_level::{grant_row['id']}").set_value(documents_repo.LEVEL_MANAGE).run(timeout=30)
+        at.button(key=f"doc_repo_admin_access_save_btn::{grant_row['id']}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        grants = {g["subject"]: g["level"] for g in documents_repo.list_category_access(ADMIN_EMAIL, cat_id, secrets_getter=admin_secrets_getter)}
+        self.assertEqual(grants[VIEWER_EMAIL], documents_repo.LEVEL_MANAGE)
+
+        at.button(key=f"doc_repo_admin_access_revoke_btn::{grant_row['id']}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(documents_repo.list_category_access(ADMIN_EMAIL, cat_id, secrets_getter=admin_secrets_getter), [])
+
+    # -----------------------------------------------------------------
+    # Admin tab: archived records across categories, with restore
+    # -----------------------------------------------------------------
+    def test_admin_archived_records_view_and_restore(self):
+        cat_a = documents_repo.create_category(ADMIN_EMAIL, "Archived View A", secrets_getter=admin_secrets_getter)
+        cat_b = documents_repo.create_category(ADMIN_EMAIL, "Archived View B", secrets_getter=admin_secrets_getter)
+        doc_a = documents_repo.add_document(ADMIN_EMAIL, cat_a, "Doc A", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        doc_b = documents_repo.add_document(ADMIN_EMAIL, cat_b, "Doc B", PDF_BYTES, "b.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.archive_document(ADMIN_EMAIL, doc_a, secrets_getter=admin_secrets_getter)
+        documents_repo.archive_document(ADMIN_EMAIL, doc_b, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        restore_buttons = {b.key for b in at.button if b.key and b.key.startswith("doc_repo_admin_restore_btn::")}
+        self.assertEqual(restore_buttons, {f"doc_repo_admin_restore_btn::{doc_a}", f"doc_repo_admin_restore_btn::{doc_b}"})
+
+        at.button(key=f"doc_repo_admin_restore_btn::{doc_a}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(documents_repo.get_document_detail(ADMIN_EMAIL, doc_a, secrets_getter=admin_secrets_getter)["status"], documents_repo.STATUS_ACTIVE)
+        self.assertEqual(documents_repo.get_document_detail(ADMIN_EMAIL, doc_b, secrets_getter=admin_secrets_getter)["status"], documents_repo.STATUS_ARCHIVED)
+
+    # -----------------------------------------------------------------
+    # Admin tab: audit log viewer
+    # -----------------------------------------------------------------
+    def test_admin_audit_log_shows_newest_first_and_filters(self):
+        documents_repo.create_category(ADMIN_EMAIL, "Audit Cat One", secrets_getter=admin_secrets_getter)
+        documents_repo.create_category(ADMIN_EMAIL, "Audit Cat Two", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+
+        audit_tables = [df for df in at.dataframe if "Action" in df.value.columns]
+        self.assertEqual(len(audit_tables), 1)
+        actions = audit_tables[0].value["Action"].tolist()
+        self.assertIn("create_category", actions)
+
+        at.text_input(key="doc_repo_admin_audit_action_filter").set_value("create_category").run(timeout=30)
+        self.assertFalse(at.exception)
+        audit_tables = [df for df in at.dataframe if "Action" in df.value.columns]
+        self.assertTrue(all(a == "create_category" for a in audit_tables[0].value["Action"].tolist()))
+
+    def test_admin_audit_log_to_today_still_shows_todays_rows(self):
+        # Regression test for the date_to off-by-one: "To" defaulting
+        # to today must not exclude rows created moments ago today --
+        # ts is a full timestamp, so a naive "ts <= today" would have
+        # excluded everything from today.
+        documents_repo.create_category(ADMIN_EMAIL, "Audit Today", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.date_input(key="doc_repo_admin_audit_date_to").set_value(date.today()).run(timeout=30)
+        self.assertFalse(at.exception)
+
+        audit_tables = [df for df in at.dataframe if "Action" in df.value.columns]
+        self.assertEqual(len(audit_tables), 1)
+        self.assertIn("create_category", audit_tables[0].value["Action"].tolist())
+
+    def test_admin_audit_log_survives_malicious_text_without_crashing(self):
+        documents_repo.create_category(ADMIN_EMAIL, "![x](http://example.test/a.png) [click](http://example.test)", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+
+    # -----------------------------------------------------------------
+    # Audit completeness: one row per mutation, correct actor/action
+    # -----------------------------------------------------------------
+    def test_audit_completeness_for_admin_mutations(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Audit Completeness", secrets_getter=admin_secrets_getter)
+        documents_repo.rename_category(ADMIN_EMAIL, cat_id, "Renamed", secrets_getter=admin_secrets_getter)
+        documents_repo.deactivate_category(ADMIN_EMAIL, cat_id, secrets_getter=admin_secrets_getter)
+        documents_repo.reactivate_category(ADMIN_EMAIL, cat_id, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+        documents_repo.update_doc_user_role(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_CONTRIBUTOR, secrets_getter=admin_secrets_getter)
+        documents_repo.deactivate_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, secrets_getter=admin_secrets_getter)
+        documents_repo.reactivate_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.revoke_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Doc", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.archive_document(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        documents_repo.restore_document(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+
+        for action in (
+            "create_category", "rename_category", "deactivate_category", "reactivate_category",
+            "create_doc_user", "update_doc_user_role", "deactivate_doc_user", "reactivate_doc_user",
+            "grant_category_access", "revoke_category_access",
+            "add_document", "archive_document", "restore_document",
+        ):
+            rows = documents_repo.list_audit_log(ADMIN_EMAIL, action_filter=action, secrets_getter=admin_secrets_getter, page_size=100)
+            matching = [r for r in rows if r["action"] == action]
+            self.assertEqual(len(matching), 1, f"expected exactly one {action!r} row, got {len(matching)}")
+            self.assertEqual(matching[0]["actor_email"], ADMIN_EMAIL)
 
 
 if __name__ == "__main__":
