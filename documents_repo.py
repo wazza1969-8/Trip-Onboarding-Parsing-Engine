@@ -779,6 +779,72 @@ def list_categories(actor_email: str, db_path: Path = DEFAULT_DB_PATH, secrets_g
         conn.close()
 
 
+def get_access_level(actor_email: str, category_id: int, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> str | None:
+    """Read-only, side-effect-free (Phase 3 addition): actor_email's
+    access level on category_id -- the literal string "admin" if
+    they're an admin (full access everywhere; admins have no
+    doc_category_access row of their own to report), otherwise their
+    level ("view"/"contribute"/"manage") from doc_category_access, or
+    None if they have no access row on this category at all. No audit
+    row is written -- same as is_admin(), this is a visibility check
+    used to decide what to show, not a mutation or a document access.
+    """
+    actor_email = _normalize_email(actor_email)
+    if not actor_email:
+        return None
+    if is_admin(actor_email, db_path=db_path, secrets_getter=secrets_getter):
+        return "admin"
+    conn = get_conn(db_path)
+    try:
+        return _access_level(conn, actor_email, category_id)
+    finally:
+        conn.close()
+
+
+def categories_with_min_level(actor_email: str, min_level: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> list[dict]:
+    """Read-only (Phase 3 addition): the subset of
+    list_categories(actor_email) where the actor has at least
+    min_level access. An admin gets every category list_categories()
+    already returns unfiltered -- admins aren't gated by
+    doc_category_access at all, so there's no per-category level to
+    compare. Useful for deciding what to show, e.g. an upload
+    category dropdown (min_level=LEVEL_CONTRIBUTE) or whether a
+    "show archived" control should appear at all (min_level=LEVEL_MANAGE).
+    """
+    categories = list_categories(actor_email, db_path=db_path, secrets_getter=secrets_getter)
+    if is_admin(actor_email, db_path=db_path, secrets_getter=secrets_getter):
+        return categories
+    conn = get_conn(db_path)
+    try:
+        return [c for c in categories if _has_level(conn, actor_email, c["id"], min_level)]
+    finally:
+        conn.close()
+
+
+def find_duplicate_by_sha256(actor_email: str, category_id: int, sha256: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> dict | None:
+    """Read-only (Phase 3 addition): the active document in
+    category_id whose current version has this exact sha256, if any --
+    used to warn about (never to block) a likely duplicate upload.
+    Requires at least view access on the category, same as any other
+    read in this module; a denial is audited like every other one."""
+    actor_email = _require_actor(actor_email)
+    conn = get_conn(db_path)
+    _set_row_factory(conn)
+    try:
+        if not _authorized_for_category(conn, actor_email, category_id, LEVEL_VIEW, secrets_getter):
+            _deny(conn, actor_email, "find_duplicate_by_sha256", category_id=category_id)
+        row = conn.execute(
+            """SELECT d.* FROM documents d
+               JOIN document_versions v ON v.id = d.current_version_id
+               WHERE d.category_id = ? AND d.status = ? AND v.sha256 = ?
+               LIMIT 1""",
+            (category_id, STATUS_ACTIVE, sha256),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Category access
 # ---------------------------------------------------------------------------
@@ -1194,6 +1260,16 @@ def list_documents(
     PermissionDenied; an unscoped call instead just silently narrows to
     the categories actor_email (or everyone, if admin) can see -- that
     is normal browsing, not a denial worth logging.
+
+    Archived documents (status='archived', or status=None which asks
+    for both statuses at once) additionally require manage-level
+    access on that document's category (or admin) -- view/contribute
+    access only ever grants the active document. An explicit
+    category_id with status='archived' and no manage access on it
+    raises PermissionDenied, same as any other category_id the actor
+    can't see at all; status=None instead just quietly drops archived
+    rows from whichever categories are below manage level, the same
+    way any other inaccessible category is quietly dropped.
     """
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
@@ -1202,6 +1278,11 @@ def list_documents(
         is_admin = _is_admin(conn, actor_email, secrets_getter)
         if category_id is not None and not is_admin and not _has_level(conn, actor_email, category_id, LEVEL_VIEW):
             _deny(conn, actor_email, "list_documents", category_id=category_id)
+        if (
+            category_id is not None and status == STATUS_ARCHIVED and not is_admin
+            and not _has_level(conn, actor_email, category_id, LEVEL_MANAGE)
+        ):
+            _deny(conn, actor_email, "list_documents", category_id=category_id, detail="archived")
 
         clauses = []
         params: list = []
@@ -1209,6 +1290,21 @@ def list_documents(
         if not is_admin:
             clauses.append("d.category_id IN (SELECT category_id FROM doc_category_access WHERE subject = ?)")
             params.append(actor_email)
+            if status is None or status == STATUS_ARCHIVED:
+                # Archived rows are only visible in categories where
+                # this actor has manage-level access -- view/contribute
+                # access only ever grants the active document. An
+                # explicit category_id without manage access was
+                # already denied above when status is exactly
+                # STATUS_ARCHIVED; for status=None (both statuses at
+                # once) this instead just quietly drops archived rows
+                # from categories below manage level, same as any
+                # other category this actor can't see.
+                clauses.append(
+                    "(d.status != ? OR d.category_id IN "
+                    "(SELECT category_id FROM doc_category_access WHERE subject = ? AND level = ?))"
+                )
+                params.extend([STATUS_ARCHIVED, actor_email, LEVEL_MANAGE])
         if category_id is not None:
             clauses.append("d.category_id = ?")
             params.append(category_id)

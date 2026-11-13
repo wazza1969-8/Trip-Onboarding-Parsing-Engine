@@ -1,18 +1,39 @@
 """
-Document Repository screen -- Phase 2: browse / search / download only.
+Document Repository screen -- Phase 3: browse/search/download (Phase 2)
+plus upload, replace, edit metadata, archive/restore, and an
+admin/manage-level "show archived" toggle.
 
-No upload, replace, archive, category-management, access-management, or
-audit-viewer screens here -- those are later phases. Everything below
-goes through documents_repo.py's existing public functions exactly like
-any other caller would: no raw SQL, and nothing here ever reads
-document_blobs or loads file bytes before the user explicitly asks for
-them via "Prepare download".
+No category-management, access-management, or audit-viewer screens
+here -- those are still later phases. Everything below goes through
+documents_repo.py's existing public functions exactly like any other
+caller would: no raw SQL, and nothing here ever reads document_blobs
+or loads file bytes before the user explicitly asks for them (a
+"Prepare download" click, or an actual Upload/Replace submission).
 
-All document data rendered here (titles, descriptions, keywords, file
-names, uploader emails) is untrusted text written by whoever uploaded
-or described a document. It is shown with st.write/st.caption/
-st.dataframe only -- never unsafe_allow_html -- so it is always
-rendered as plain text, never interpreted as HTML/markup.
+All document data rendered here (titles, category names, descriptions,
+keywords, file names, change notes, uploader emails, and any of those
+that might be echoed back inside a documents_repo exception message)
+is untrusted text written by whoever uploaded or described a document.
+unsafe_allow_html is never used -- but that alone is not enough: every
+one of st.markdown/st.write/st.caption/st.success/st.error/st.warning/
+st.toast, AND widget labels/help text, AND st.progress's text=, render
+a Markdown subset (bold/italic/strikethrough/code/links/images),
+confirmed empirically in a real browser -- so a title like
+"![x](http://evil/a.png)" would otherwise render as an actual embedded
+image. Every such interpolation below goes through _escape_markdown()
+first. (The one exception that needs no escaping: st.dataframe's plain
+cells, and any st.selectbox/st.radio option label via format_func --
+neither renders Markdown.) _escape_markdown() blocks the image/link/
+bold/etc. *syntax* outright; a bare URL substring can still be
+separately autolinked by the underlying renderer in some of those call
+sites (not st.button/st.download_button, which don't autolink at all),
+but the escaping corrupts the resulting href, so it never resolves to
+the attacker's real domain -- see _escape_markdown()'s own docstring.
+
+UI-level gating here (which tab/button/toggle is shown) is a
+convenience, not the security boundary -- documents_repo.py re-checks
+every call's authorization itself regardless of what this module
+decided to display, exactly as it does for any other caller.
 
 Nothing here uses st.cache_data/st.cache_resource: every query already
 takes actor_email and is permission-scoped per call, so caching it
@@ -23,13 +44,30 @@ the left-hand list -- is kept in st.session_state instead, which is
 already private to one browser session/user, with an explicit
 "Refresh" control.
 """
+import hashlib
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 
 import documents_repo
 
 PAGE_SIZE = 25
+
+# Rank order for comparing a get_access_level() result against a
+# minimum level -- "admin" always passes regardless of position here.
+_LEVEL_ORDER = [documents_repo.LEVEL_VIEW, documents_repo.LEVEL_CONTRIBUTE, documents_repo.LEVEL_MANAGE]
+
+
+def _meets_level(level: str | None, minimum: str) -> bool:
+    if level == "admin":
+        return True
+    if level is None:
+        return False
+    try:
+        return _LEVEL_ORDER.index(level) >= _LEVEL_ORDER.index(minimum)
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +95,132 @@ def _format_timestamp(iso_ts) -> str:
 
 def _secrets_getter():
     return st.secrets
+
+
+def _escape_markdown(text) -> str:
+    """Escapes Markdown special characters (backslash, backtick,
+    asterisk, underscore, braces, brackets, parentheses, #, +, -, .,
+    !, |, >, ~, <) so untrusted text can be safely interpolated into
+    any Streamlit call that renders Markdown -- confirmed empirically
+    (in a real rendered browser, not just AppTest) that this covers
+    not just st.markdown/st.write/st.caption/st.success/st.error/
+    st.warning/st.toast, but also widget labels/help text and
+    st.progress's text=. Backslash is escaped first, so escaping the
+    rest doesn't get double-escaped. None becomes "".
+
+    Known limitation: this defeats the explicit image (![alt](url))
+    and link ([text](url)) *syntax*, and inline bold/italic/code/etc,
+    but not a bare http(s):// URL substring getting separately
+    "autolinked" by the underlying renderer in some of those call
+    sites (not st.button/st.download_button, which don't autolink at
+    all) -- there is no character in the required escape set that
+    defeats bare-URL autolinking specifically. In practice this is not
+    an open redirect: the backslashes this function inserts get
+    URL-encoded into the resulting href (e.g. "example\\.test"
+    becomes "example%5C.test"), so any such residual link never
+    resolves to the attacker's real domain.
+    """
+    if text is None:
+        return ""
+    text = str(text)
+    out = text.replace("\\", "\\\\")
+    for ch in "`*_{}[]()#+-.!|>~<":
+        out = out.replace(ch, f"\\{ch}")
+    return out
+
+
+def _default_title_from_filename(filename: str) -> str:
+    """'quarterly report.pdf' -> 'quarterly report' -- just the
+    prefilled suggestion in the upload form's editable title field."""
+    base = (filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if "." in base:
+        base = base.rsplit(".", 1)[0]
+    return base or (filename or "")
+
+
+# ---------------------------------------------------------------------------
+# process_uploads -- pure function, no Streamlit calls, so it is
+# unit-testable without driving the file_uploader widget.
+# ---------------------------------------------------------------------------
+def process_uploads(
+    actor_email: str,
+    category_id: int,
+    uploads: list[dict],
+    description: str = "",
+    keywords: str = "",
+    db_path: Path = documents_repo.DEFAULT_DB_PATH,
+    secrets_getter=None,
+    store=None,
+    progress_callback=None,
+) -> list[dict]:
+    """Uploads a batch of files one at a time, through
+    documents_repo.add_document() -- never raw SQL, never touching
+    document_blobs directly. `uploads` is a list of
+    {"filename": str, "data": bytes, "title": str} dicts (title may be
+    blank, in which case _default_title_from_filename(filename) is
+    used). description/keywords apply to every file in the batch.
+
+    One bad file never stops the rest: every item gets its own result
+    dict, win or lose --
+        {"filename", "title", "success", "document_id", "warning", "error"}
+    -- so a caller can show a full per-file result list even when some
+    files failed. A failure's "error" is always add_document()'s own
+    specific message (empty/oversized/disallowed type/content doesn't
+    match extension/macro-enabled/not authorized) or, for anything
+    unexpected, a generic message -- never a raw traceback.
+
+    A same-category active document already sharing a file's exact
+    SHA-256 is reported as a non-blocking "warning" on that file's
+    result -- the upload still proceeds.
+
+    progress_callback(fraction, filename), if given, is called after
+    each file finishes (success or failure) -- this function itself
+    never touches st.progress or any other Streamlit call, so it can
+    be unit-tested directly.
+    """
+    results = []
+    total = len(uploads) or 1
+    for i, item in enumerate(uploads, start=1):
+        filename = item.get("filename") or ""
+        data = item.get("data") or b""
+        title = (item.get("title") or "").strip() or _default_title_from_filename(filename)
+        result = {
+            "filename": filename, "title": title, "success": False,
+            "document_id": None, "warning": None, "error": None,
+        }
+
+        if data:
+            try:
+                sha256 = hashlib.sha256(data).hexdigest()
+                duplicate = documents_repo.find_duplicate_by_sha256(
+                    actor_email, category_id, sha256, db_path=db_path, secrets_getter=secrets_getter,
+                )
+                if duplicate is not None:
+                    result["warning"] = f"An active document already has this exact content: '{duplicate['title']}'."
+            except documents_repo.PermissionDenied:
+                pass  # the add_document() call below reports the real denial
+
+        try:
+            document_id = documents_repo.add_document(
+                actor_email, category_id, title, data, filename,
+                description=description, keywords=keywords,
+                db_path=db_path, secrets_getter=secrets_getter, store=store,
+            )
+            result["success"] = True
+            result["document_id"] = document_id
+        except documents_repo.PermissionDenied as e:
+            result["error"] = str(e)
+        except documents_repo.ValidationError as e:
+            result["error"] = str(e)
+        except ValueError as e:
+            result["error"] = str(e)
+        except Exception:
+            result["error"] = "Couldn't upload this file right now."
+
+        results.append(result)
+        if progress_callback is not None:
+            progress_callback(i / total, filename)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +264,7 @@ def render_document_repository(actor_email: str) -> None:
     try:
         categories = documents_repo.list_categories(actor_email, secrets_getter=secrets_getter)
     except documents_repo.PermissionDenied as e:
-        st.error(str(e))
+        st.error(_escape_markdown(str(e)))
         return
     except Exception:
         st.error("Couldn't load categories right now.")
@@ -112,18 +276,43 @@ def render_document_repository(actor_email: str) -> None:
 
     categories_by_id = {c["id"]: c for c in categories}
 
-    col_left, col_main = st.columns([1, 3])
-
-    with col_left:
-        selected_category = _render_category_list(actor_email, categories, secrets_getter)
-
-    with col_main:
-        docs, filters_active = _render_filters_and_table(
-            actor_email, selected_category, secrets_getter,
+    try:
+        contributable = documents_repo.categories_with_min_level(
+            actor_email, documents_repo.LEVEL_CONTRIBUTE, secrets_getter=secrets_getter,
         )
+    except Exception:
+        contributable = []
+    try:
+        manageable = documents_repo.categories_with_min_level(
+            actor_email, documents_repo.LEVEL_MANAGE, secrets_getter=secrets_getter,
+        )
+    except Exception:
+        manageable = []
+    can_show_archived_toggle = is_admin or bool(manageable)
 
-    st.divider()
-    _render_detail_panel(actor_email, docs, categories_by_id, is_admin, secrets_getter)
+    if contributable:
+        tab_browse, tab_upload = st.tabs(["Browse", "Upload"])
+    else:
+        (tab_browse,) = st.tabs(["Browse"])
+        tab_upload = None
+
+    with tab_browse:
+        col_left, col_main = st.columns([1, 3])
+
+        with col_left:
+            selected_category = _render_category_list(actor_email, categories, secrets_getter)
+
+        with col_main:
+            docs, filters_active = _render_filters_and_table(
+                actor_email, selected_category, secrets_getter, can_show_archived_toggle,
+            )
+
+        st.divider()
+        _render_detail_panel(actor_email, docs, categories_by_id, is_admin, secrets_getter)
+
+    if tab_upload is not None:
+        with tab_upload:
+            _render_upload_tab(actor_email, contributable, secrets_getter)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +341,7 @@ def _render_category_list(actor_email: str, categories: list[dict], secrets_gett
     option_ids: list[int | None] = [None] + [c["id"] for c in categories]
     labels = {None: f"All categories ({sum(counts.values())})"}
     for cat in categories:
-        labels[cat["id"]] = f"{cat['name']} ({counts.get(cat['id'], 0)})"
+        labels[cat["id"]] = f"{_escape_markdown(cat['name'])} ({counts.get(cat['id'], 0)})"
 
     return st.radio(
         "Category", option_ids, format_func=lambda cid: labels[cid],
@@ -163,7 +352,16 @@ def _render_category_list(actor_email: str, categories: list[dict], secrets_gett
 # ---------------------------------------------------------------------------
 # Main column: search/filters + table
 # ---------------------------------------------------------------------------
-def _render_filters_and_table(actor_email: str, selected_category: int | None, secrets_getter):
+def _render_filters_and_table(actor_email: str, selected_category: int | None, secrets_getter, can_show_archived_toggle: bool):
+    show_archived = False
+    if can_show_archived_toggle:
+        show_archived = st.toggle(
+            "Show archived", key="doc_repo_show_archived",
+            help="Archived documents are only shown if you have manage access (or are an admin) "
+                 "on the category they're in.",
+        )
+    status_filter = None if show_archived else documents_repo.STATUS_ACTIVE
+
     with st.container(border=True):
         col_search, col_type, col_from, col_to = st.columns([2, 1, 1, 1])
         with col_search:
@@ -185,7 +383,7 @@ def _render_filters_and_table(actor_email: str, selected_category: int | None, s
     date_to_value = date_to.isoformat() if date_to else None
     filters_active = bool(search.strip() or file_type_value or date_from_value or date_to_value)
 
-    filter_signature = (selected_category, search, file_type_value, date_from_value, date_to_value)
+    filter_signature = (selected_category, search, file_type_value, date_from_value, date_to_value, show_archived)
     if st.session_state.get("_doc_repo_last_filter_sig") != filter_signature:
         st.session_state["doc_repo_page"] = 1
         st.session_state["_doc_repo_last_filter_sig"] = filter_signature
@@ -200,12 +398,13 @@ def _render_filters_and_table(actor_email: str, selected_category: int | None, s
                 file_type=file_type_value,
                 date_from=date_from_value,
                 date_to=date_to_value,
+                status=status_filter,
                 page=page,
                 page_size=PAGE_SIZE,
                 secrets_getter=secrets_getter,
             )
     except documents_repo.PermissionDenied as e:
-        st.error(str(e))
+        st.error(_escape_markdown(str(e)))
         return [], filters_active
     except Exception:
         st.error("Couldn't load documents right now.")
@@ -223,6 +422,7 @@ def _render_filters_and_table(actor_email: str, selected_category: int | None, s
     table_rows = [
         {
             "Title": d["title"],
+            "Status": "Archived" if d.get("status") == documents_repo.STATUS_ARCHIVED else "Active",
             "File name": d.get("current_filename") or "—",
             "Format": (d.get("current_extension") or "—").upper(),
             "Size": _human_size(d.get("current_size_bytes")),
@@ -274,7 +474,7 @@ def _render_detail_panel(actor_email: str, docs: list[dict], categories_by_id: d
         with st.spinner("Loading document detail..."):
             detail = documents_repo.get_document_detail(actor_email, selected_doc_id, secrets_getter=secrets_getter)
     except documents_repo.PermissionDenied as e:
-        st.error(str(e))
+        st.error(_escape_markdown(str(e)))
         return
     except Exception:
         st.error("Couldn't load this document's detail right now.")
@@ -284,27 +484,37 @@ def _render_detail_panel(actor_email: str, docs: list[dict], categories_by_id: d
         st.info("This document is no longer available.")
         return
 
+    category_id = detail["category_id"]
+    try:
+        access_level = documents_repo.get_access_level(actor_email, category_id, secrets_getter=secrets_getter)
+    except Exception:
+        access_level = None
+    can_contribute = _meets_level(access_level, documents_repo.LEVEL_CONTRIBUTE)
+    can_manage = _meets_level(access_level, documents_repo.LEVEL_MANAGE)
+    is_archived = detail.get("status") == documents_repo.STATUS_ARCHIVED
+
     with st.container(border=True):
-        st.markdown(f"#### {detail['title']}")
-        category = categories_by_id.get(detail["category_id"])
-        st.write(f"**Category:** {category['name'] if category else '—'}")
-        st.write(f"**Description:** {detail.get('description') or '—'}")
-        st.write(f"**Keywords:** {detail.get('keywords') or '—'}")
+        status_badge = " (Archived)" if is_archived else ""
+        st.markdown(f"#### {_escape_markdown(detail['title'])}{status_badge}")
+        category = categories_by_id.get(category_id)
+        st.write(f"**Category:** {_escape_markdown(category['name']) if category else '—'}")
+        st.write(f"**Description:** {_escape_markdown(detail.get('description')) if detail.get('description') else '—'}")
+        st.write(f"**Keywords:** {_escape_markdown(detail.get('keywords')) if detail.get('keywords') else '—'}")
 
         st.markdown("**Version history**")
         versions = sorted(detail["versions"], key=lambda v: v["version_no"], reverse=True)
         # Old versions are only downloadable by admins and contributors
-        # (documents_repo.download_version's own rule) -- a viewer sees
-        # only the current version here too, so the list never shows an
-        # entry they could not actually open.
-        visible_versions = versions if is_admin else versions[:1]
+        # (documents_repo.download_version's own rule) -- anyone else
+        # sees only the current version here too, so the list never
+        # shows an entry they could not actually open.
+        visible_versions = versions if can_contribute else versions[:1]
         for v in visible_versions:
             st.caption(
-                f"v{v['version_no']} -- {v['filename']} -- {_human_size(v['size_bytes'])} -- "
-                f"{_format_timestamp(v['uploaded_at'])} by {v['uploaded_by']}"
-                + (f" -- {v['change_note']}" if v.get("change_note") else "")
+                f"v{v['version_no']} -- {_escape_markdown(v['filename'])} -- {_human_size(v['size_bytes'])} -- "
+                f"{_format_timestamp(v['uploaded_at'])} by {_escape_markdown(v['uploaded_by'])}"
+                + (f" -- {_escape_markdown(v['change_note'])}" if v.get("change_note") else "")
             )
-        if not is_admin and len(versions) > 1:
+        if not can_contribute and len(versions) > 1:
             st.caption(f"{len(versions) - 1} earlier version(s) -- visible to administrators and contributors only.")
 
         prepare_key = f"_doc_repo_prepared::{selected_doc_id}"
@@ -316,7 +526,7 @@ def _render_detail_panel(actor_email: str, docs: list[dict], categories_by_id: d
                     )
                 st.session_state[prepare_key] = (filename, mime_type, data)
             except documents_repo.PermissionDenied as e:
-                st.error(str(e))
+                st.error(_escape_markdown(str(e)))
             except documents_repo.StorageIntegrityError:
                 st.error(
                     "This file's stored copy failed an integrity check and can't be "
@@ -328,7 +538,239 @@ def _render_detail_panel(actor_email: str, docs: list[dict], categories_by_id: d
         if prepare_key in st.session_state:
             filename, mime_type, data = st.session_state[prepare_key]
             st.download_button(
-                f"Download {filename}", data=data, file_name=filename,
+                f"Download {_escape_markdown(filename)}", data=data, file_name=filename,
                 mime=mime_type or "application/octet-stream",
                 key=f"doc_repo_download_btn::{selected_doc_id}",
             )
+
+        if can_contribute:
+            _render_replace_and_edit(actor_email, selected_doc_id, detail, secrets_getter)
+        if can_manage:
+            _render_archive_restore(actor_email, selected_doc_id, is_archived, secrets_getter)
+
+
+# ---------------------------------------------------------------------------
+# Detail panel: Replace file / Edit details (contribute-or-higher)
+# ---------------------------------------------------------------------------
+def _render_replace_and_edit(actor_email: str, doc_id: str, detail: dict, secrets_getter) -> None:
+    with st.expander("Replace file"):
+        # A fresh key per "generation" clears the file_uploader widget
+        # after a successful replace (Streamlit has no direct "clear"
+        # call for it) -- same approach as the Upload tab's own
+        # uploader, but keyed per-document since each document's
+        # Replace uploader is independent.
+        generation_key = f"_doc_repo_replace_generation::{doc_id}"
+        generation = st.session_state.get(generation_key, 0)
+        replace_file = st.file_uploader(
+            "New file", type=sorted(documents_repo.ALLOWED_EXTENSIONS),
+            key=f"doc_repo_replace_file::{doc_id}::{generation}",
+        )
+        change_note = st.text_input("Change note (optional)", key=f"doc_repo_replace_note::{doc_id}")
+        if st.button("Replace", key=f"doc_repo_replace_btn::{doc_id}", disabled=(replace_file is None)):
+            try:
+                with st.spinner("Replacing..."):
+                    documents_repo.replace_document(
+                        actor_email, doc_id, replace_file.getvalue(), replace_file.name,
+                        change_note=change_note, secrets_getter=secrets_getter,
+                    )
+                st.session_state[generation_key] = generation + 1
+                st.toast("Replaced with a new version.")
+                st.rerun()
+            except documents_repo.PermissionDenied as e:
+                st.error(_escape_markdown(str(e)))
+            except documents_repo.ValidationError as e:
+                st.error(_escape_markdown(str(e)))
+            except Exception:
+                st.error("Couldn't replace this file right now.")
+
+    with st.expander("Edit details"):
+        new_title = st.text_input("Title", value=detail["title"], key=f"doc_repo_edit_title::{doc_id}")
+        new_description = st.text_area(
+            "Description", value=detail.get("description") or "", key=f"doc_repo_edit_description::{doc_id}",
+        )
+        new_keywords = st.text_input(
+            "Keywords", value=detail.get("keywords") or "", key=f"doc_repo_edit_keywords::{doc_id}",
+        )
+        if st.button("Save details", key=f"doc_repo_save_details_btn::{doc_id}"):
+            try:
+                documents_repo.update_metadata(
+                    actor_email, doc_id, title=new_title, description=new_description,
+                    keywords=new_keywords, secrets_getter=secrets_getter,
+                )
+                st.toast("Saved.")
+                st.rerun()
+            except documents_repo.PermissionDenied as e:
+                st.error(_escape_markdown(str(e)))
+            except ValueError as e:
+                st.error(_escape_markdown(str(e)))
+            except Exception:
+                st.error("Couldn't save these changes right now.")
+
+
+# ---------------------------------------------------------------------------
+# Detail panel: Archive / Restore (manage-level or admin)
+# ---------------------------------------------------------------------------
+def _render_archive_restore(actor_email: str, doc_id: str, is_archived: bool, secrets_getter) -> None:
+    if is_archived:
+        if st.button("Restore", key=f"doc_repo_restore_btn::{doc_id}"):
+            try:
+                documents_repo.restore_document(actor_email, doc_id, secrets_getter=secrets_getter)
+                st.toast("Restored.")
+                st.rerun()
+            except documents_repo.PermissionDenied as e:
+                st.error(_escape_markdown(str(e)))
+            except Exception:
+                st.error("Couldn't restore this document right now.")
+        return
+
+    confirm_key = f"_doc_repo_confirm_archive::{doc_id}"
+    if not st.session_state.get(confirm_key):
+        if st.button("Archive", key=f"doc_repo_archive_btn::{doc_id}"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.warning("Archive this document? It will be hidden from the normal browse list, but not deleted.")
+    col_yes, col_no = st.columns(2)
+    with col_yes:
+        if st.button("Yes, archive", key=f"doc_repo_confirm_archive_btn::{doc_id}", type="primary"):
+            try:
+                documents_repo.archive_document(actor_email, doc_id, secrets_getter=secrets_getter)
+                st.session_state.pop(confirm_key, None)
+                st.toast("Archived.")
+                st.rerun()
+            except documents_repo.PermissionDenied as e:
+                st.session_state.pop(confirm_key, None)
+                st.error(_escape_markdown(str(e)))
+            except Exception:
+                st.session_state.pop(confirm_key, None)
+                st.error("Couldn't archive this document right now.")
+    with col_no:
+        if st.button("Cancel", key=f"doc_repo_cancel_archive_btn::{doc_id}"):
+            st.session_state.pop(confirm_key, None)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Upload tab -- shown only when contributable_categories is non-empty
+# (see render_document_repository()).
+# ---------------------------------------------------------------------------
+def _render_upload_tab(actor_email: str, contributable_categories: list[dict], secrets_getter) -> None:
+    category_options = {c["id"]: c["name"] for c in contributable_categories}
+    selected_category_id = st.selectbox(
+        "Category", list(category_options), format_func=lambda cid: category_options[cid],
+        key="doc_repo_upload_category",
+    )
+
+    generation = st.session_state.get("_doc_repo_uploader_generation", 0)
+    uploader_key = f"doc_repo_uploader_{generation}"
+    uploaded_files = st.file_uploader(
+        "Files to upload", type=sorted(documents_repo.ALLOWED_EXTENSIONS),
+        accept_multiple_files=True, key=uploader_key,
+    )
+
+    description = st.text_area(
+        "Description (optional -- applies to every file in this batch)",
+        key="doc_repo_upload_description",
+    )
+    keywords = st.text_input(
+        "Keywords (optional -- applies to every file in this batch)",
+        key="doc_repo_upload_keywords",
+    )
+
+    # Keyed on (uploader generation, file position, name, size,
+    # category) rather than re-hashing + re-querying the database on
+    # every rerun -- recomputes automatically whenever any of those
+    # actually change (a new file batch bumps the generation; picking
+    # a different category changes the last element of the key).
+    dup_cache = st.session_state.setdefault("_doc_repo_duplicate_cache", {})
+
+    # Keyed by the file's position in the list, not its name/size --
+    # two selected files that happen to share both would otherwise
+    # collide on the same widget key and the same titles[...] entry.
+    titles: dict[int, str] = {}
+    if uploaded_files:
+        st.markdown("**Titles**")
+        for i, f in enumerate(uploaded_files):
+            title_key = f"doc_repo_upload_title::{uploader_key}::{i}"
+            titles[i] = st.text_input(
+                f"Title for {_escape_markdown(f.name)}", value=_default_title_from_filename(f.name), key=title_key,
+            )
+
+            cache_key = (generation, i, f.name, f.size, selected_category_id)
+            if cache_key in dup_cache:
+                duplicate = dup_cache[cache_key]
+            else:
+                duplicate = None
+                data = f.getvalue()
+                if data:
+                    try:
+                        sha256 = hashlib.sha256(data).hexdigest()
+                        duplicate = documents_repo.find_duplicate_by_sha256(
+                            actor_email, selected_category_id, sha256, secrets_getter=secrets_getter,
+                        )
+                    except documents_repo.PermissionDenied:
+                        duplicate = None  # the Upload button below reports the real denial
+                dup_cache[cache_key] = duplicate
+
+            if duplicate is not None:
+                st.warning(
+                    f"'{_escape_markdown(f.name)}': an active document already has this exact content "
+                    f"('{_escape_markdown(duplicate['title'])}'). You can still upload it."
+                )
+
+    uploading_key = "_doc_repo_upload_in_progress"
+    file_count = len(uploaded_files or [])
+    upload_clicked = st.button(
+        f"Upload {file_count} file(s)", key="doc_repo_upload_btn",
+        disabled=(file_count == 0 or st.session_state.get(uploading_key, False)),
+    )
+
+    if upload_clicked:
+        st.session_state[uploading_key] = True
+        progress = st.progress(0.0, text="Starting upload...")
+
+        def _on_progress(fraction: float, filename: str) -> None:
+            escaped = _escape_markdown(filename)
+            progress.progress(fraction, text=f"Uploaded {escaped}" if fraction >= 1.0 else f"Uploading {escaped}...")
+
+        uploads = [
+            {"filename": f.name, "data": f.getvalue(), "title": titles.get(i, "")}
+            for i, f in enumerate(uploaded_files)
+        ]
+        try:
+            results = process_uploads(
+                actor_email, selected_category_id, uploads,
+                description=description, keywords=keywords,
+                secrets_getter=secrets_getter, progress_callback=_on_progress,
+            )
+        except Exception:
+            results = [
+                {"filename": u["filename"], "title": u["title"], "success": False,
+                 "document_id": None, "warning": None, "error": "Couldn't process this upload batch right now."}
+                for u in uploads
+            ]
+        progress.empty()
+        st.session_state[uploading_key] = False
+        # A fresh key clears the file_uploader widget on the next render
+        # (Streamlit has no direct "clear" call for it) -- this also
+        # clears the per-file title inputs, since their keys are
+        # derived from uploader_key.
+        st.session_state["_doc_repo_uploader_generation"] = generation + 1
+        st.session_state["_doc_repo_last_upload_results"] = results
+        st.rerun()
+
+    last_results = st.session_state.pop("_doc_repo_last_upload_results", None)
+    if last_results:
+        st.markdown("**Upload results**")
+        for r in last_results:
+            filename = _escape_markdown(r["filename"])
+            if r["success"]:
+                message = f"'{filename}' uploaded as '{_escape_markdown(r['title'])}'."
+                if r.get("warning"):
+                    st.success(message)
+                    st.caption(f"Note: {_escape_markdown(r['warning'])}")
+                else:
+                    st.success(message)
+            else:
+                st.error(f"'{filename}' failed: {_escape_markdown(r['error'])}")

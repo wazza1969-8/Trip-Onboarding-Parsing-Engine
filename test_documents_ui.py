@@ -1,11 +1,12 @@
 """
-Automated tests for the Document Repository tile/screen (Phase 2:
-browse/search/download only) -- both the app.py hook points and
+Automated tests for the Document Repository tile/screen -- Phase 2
+(browse/search/download) and Phase 3 (upload, replace, edit metadata,
+archive/restore, "show archived") -- both the app.py hook points and
 documents_ui.py's rendering, driven through Streamlit's AppTest
 harness, same pattern as test_weekly_report.py's UITests.
 
-Covers: the tile hidden by default (including the "in password mode"
-case, as far as AppTest can actually exercise it -- see
+Phase 2 coverage: the tile hidden by default (including the "in
+password mode" case, as far as AppTest can actually exercise it -- see
 test_tile_hidden_when_not_authenticated_via_real_okta()'s docstring for
 why that is the honest limit of what this harness can simulate here);
 tile shown for an admin; the landing screen's layout unchanged when the
@@ -16,6 +17,40 @@ document_blobs; a broken documents_repo import leaving the rest of the
 app untouched; and the tile-visibility TTL cache in
 _can_see_document_repository() (reused within 300s, recomputed after
 it expires or the signed-in email changes, errors cached as False).
+
+Phase 3 coverage: process_uploads() unit-tested directly (no widget
+driving needed) for a mixed batch of good/bad files, the duplicate-
+content warning, and refusal for a contributor without access or a
+viewer; AppTest DOES turn out to support driving st.file_uploader (via
+.set_value()), confirmed empirically before writing these -- so the
+Upload tab itself, Replace file, and the archived-listing/toggle
+behavior are also covered end-to-end through AppTest, not just at the
+process_uploads() level.
+
+Phase 3 fix-up coverage: _escape_markdown() neutralizes image/link/
+bold/etc Markdown syntax (verified both as a pure-function unit test
+and, separately, as a rendered-text assertion through the detail
+panel) -- confirmed in a REAL rendered browser (not just AppTest, which
+only exposes the Markdown source string, never rendered HTML) that
+every one of st.markdown/st.write/st.caption/st.success/st.error/
+st.warning, widget labels, and st.progress's text= all render this
+Markdown subset, so a title containing
+"![x](http://example.test/a.png) [click](http://example.test)" would
+otherwise render as an actual image/link; two uploaded files sharing
+the same name and size no longer collide on the same widget key (now
+keyed by list position); a successful Replace resets that document's
+file_uploader; and the duplicate-content check is cached per selected
+file and only recomputed when the category changes.
+
+Deliberately out of scope for automated proof here (reported in the
+delivery notes instead, not silently skipped): the real browser
+finding that even escaped text can still have a *bare* URL substring
+autolinked by the underlying renderer in some of these same call sites
+(not st.button/st.download_button) -- escaping defeats the explicit
+image/link syntax and corrupts any such residual autolink's href (it
+never resolves to the real domain), but AppTest cannot render real
+HTML, so there is no way to assert "zero <a> elements" from here; the
+browser-based verification already done stands in for that.
 
 ISOLATION: app.py (and documents_ui.py) never pass an explicit db_path
 to any documents_repo call -- same late-binding situation
@@ -32,12 +67,15 @@ Run with:
 unittest -- for _RUNNING_UNDER_TEST in app.py to correctly skip the
 real Okta/password gate. See app.py's own docstring for that flag.)
 """
+import io
 import sqlite3
 import sys
 import unittest
+import zipfile
 from unittest import mock
 
 import documents_repo
+import documents_ui
 
 try:
     from streamlit.testing.v1 import AppTest
@@ -46,10 +84,28 @@ except ImportError:
     _APPTEST_AVAILABLE = False
 
 ADMIN_EMAIL = "admin@example.test"
+CONTRIBUTOR_EMAIL = "contributor@example.test"
 VIEWER_EMAIL = "viewer@example.test"
 OUTSIDER_EMAIL = "outsider@example.test"
 
 PDF_BYTES = b"%PDF-1.4\n%fake pdf content for tests\n"
+
+
+def make_pdf(total_size=None):
+    header = b"%PDF-1.4\n%fake pdf content for tests\n"
+    if total_size is None:
+        return header
+    return header + b"0" * (total_size - len(header))
+
+
+def make_ooxml_zip(macro=False):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", "<document/>")
+        if macro:
+            zf.writestr("word/vbaProject.bin", b"fake macro project bytes")
+    return buf.getvalue()
 
 
 def admin_secrets_getter():
@@ -68,6 +124,154 @@ def _clear_document_repo_tables():
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# process_uploads() -- a plain function, no Streamlit calls, so these
+# never touch AppTest at all; they call it directly like any other
+# unit test would.
+# ---------------------------------------------------------------------------
+class ProcessUploadsTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.secrets_getter = admin_secrets_getter
+        self.category_id = documents_repo.create_category(
+            ADMIN_EMAIL, "Uploads", db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+
+    def tearDown(self):
+        import os
+        os.remove(self.db_path)
+
+    def _upload(self, actor_email, uploads, **kwargs):
+        return documents_ui.process_uploads(
+            actor_email, self.category_id, uploads, db_path=self.db_path,
+            secrets_getter=self.secrets_getter, **kwargs,
+        )
+
+    def test_mixed_batch_good_files_succeed_bad_files_report_specific_errors(self):
+        uploads = [
+            {"filename": "good.pdf", "data": make_pdf(), "title": "Good File"},
+            {"filename": "empty.pdf", "data": b"", "title": "Empty File"},
+            {"filename": "huge.pdf", "data": make_pdf(documents_repo.MAX_FILE_SIZE_BYTES + 1), "title": "Huge File"},
+            {"filename": "spoofed.pdf", "data": b"not actually a pdf", "title": "Spoofed File"},
+            {"filename": "macro.docx", "data": make_ooxml_zip(macro=True), "title": "Macro File"},
+            {"filename": "bad.exe", "data": b"whatever bytes", "title": "Disallowed File"},
+        ]
+        results = self._upload(ADMIN_EMAIL, uploads)
+        by_filename = {r["filename"]: r for r in results}
+
+        self.assertTrue(by_filename["good.pdf"]["success"])
+        self.assertIsNotNone(by_filename["good.pdf"]["document_id"])
+
+        self.assertFalse(by_filename["empty.pdf"]["success"])
+        self.assertIn("empty", by_filename["empty.pdf"]["error"].lower())
+
+        self.assertFalse(by_filename["huge.pdf"]["success"])
+        self.assertIn("large", by_filename["huge.pdf"]["error"].lower())
+
+        self.assertFalse(by_filename["spoofed.pdf"]["success"])
+        self.assertIn("doesn't look like", by_filename["spoofed.pdf"]["error"])
+
+        self.assertFalse(by_filename["macro.docx"]["success"])
+        self.assertIn("Macro", by_filename["macro.docx"]["error"])
+
+        self.assertFalse(by_filename["bad.exe"]["success"])
+        self.assertIn("aren't allowed", by_filename["bad.exe"]["error"])
+
+        # One bad file must never stop the others -- all six were attempted.
+        self.assertEqual(len(results), 6)
+
+    def test_default_title_from_filename_when_blank(self):
+        results = self._upload(ADMIN_EMAIL, [{"filename": "quarterly report.pdf", "data": make_pdf(), "title": ""}])
+        self.assertEqual(results[0]["title"], "quarterly report")
+
+    def test_duplicate_warning_is_non_blocking(self):
+        data = make_pdf()
+        documents_repo.add_document(
+            ADMIN_EMAIL, self.category_id, "Original", data, "original.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        results = self._upload(ADMIN_EMAIL, [{"filename": "copy.pdf", "data": data, "title": "Copy"}])
+        self.assertTrue(results[0]["success"])
+        self.assertIsNotNone(results[0]["warning"])
+        self.assertIn("Original", results[0]["warning"])
+
+    def test_no_warning_for_unique_content(self):
+        results = self._upload(ADMIN_EMAIL, [{"filename": "unique.pdf", "data": make_pdf(), "title": "Unique"}])
+        self.assertTrue(results[0]["success"])
+        self.assertIsNone(results[0]["warning"])
+
+    def test_contributor_without_access_refused(self):
+        results = self._upload(CONTRIBUTOR_EMAIL, [{"filename": "a.pdf", "data": make_pdf(), "title": "A"}])
+        self.assertFalse(results[0]["success"])
+        self.assertIn("not allowed", results[0]["error"])
+
+    def test_viewer_cannot_upload(self):
+        documents_repo.grant_category_access(
+            ADMIN_EMAIL, self.category_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW,
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        results = self._upload(VIEWER_EMAIL, [{"filename": "a.pdf", "data": make_pdf(), "title": "A"}])
+        self.assertFalse(results[0]["success"])
+        self.assertIn("not allowed", results[0]["error"])
+
+    def test_contributor_with_access_succeeds(self):
+        documents_repo.grant_category_access(
+            ADMIN_EMAIL, self.category_id, CONTRIBUTOR_EMAIL, documents_repo.LEVEL_CONTRIBUTE,
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        results = self._upload(CONTRIBUTOR_EMAIL, [{"filename": "a.pdf", "data": make_pdf(), "title": "A"}])
+        self.assertTrue(results[0]["success"])
+
+    def test_progress_callback_called_once_per_file(self):
+        calls = []
+        uploads = [
+            {"filename": "a.pdf", "data": make_pdf(), "title": "A"},
+            {"filename": "b.pdf", "data": make_pdf(), "title": "B"},
+        ]
+        self._upload(ADMIN_EMAIL, uploads, progress_callback=lambda fraction, filename: calls.append((fraction, filename)))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[-1][0], 1.0)
+
+
+# ---------------------------------------------------------------------------
+# _escape_markdown() -- a plain function, no Streamlit calls.
+# ---------------------------------------------------------------------------
+class MarkdownEscapingTests(unittest.TestCase):
+    MALICIOUS_TEXT = "![x](http://example.test/a.png) [click](http://example.test)"
+
+    def test_none_becomes_empty_string(self):
+        self.assertEqual(documents_ui._escape_markdown(None), "")
+
+    def test_image_and_link_syntax_characters_are_all_escaped(self):
+        escaped = documents_ui._escape_markdown(self.MALICIOUS_TEXT)
+        # The exact raw substrings that form the image/link constructs
+        # must never survive unescaped.
+        self.assertNotIn("![x](", escaped)
+        self.assertNotIn("[click](", escaped)
+        self.assertIn("\\!\\[x\\]\\(", escaped)
+        self.assertIn("\\[click\\]\\(", escaped)
+
+    def test_bold_marker_is_escaped(self):
+        self.assertNotIn("**", documents_ui._escape_markdown("**bold**"))
+
+    def test_backslash_is_escaped_before_other_characters(self):
+        # A pre-existing backslash must itself end up escaped, not
+        # interfere with (or be consumed by) escaping the character
+        # that follows it -- hence escaping backslash first.
+        backslash, asterisk = "\\", "*"
+        escaped = documents_ui._escape_markdown(backslash + asterisk)
+        self.assertEqual(escaped, backslash * 3 + asterisk)
+
+    def test_every_listed_special_character_is_escaped(self):
+        for ch in "`*_{}[]()#+-.!|>~<":
+            escaped = documents_ui._escape_markdown(f"a{ch}b")
+            self.assertEqual(escaped, f"a\\{ch}b", msg=f"character {ch!r} was not escaped")
 
 
 @unittest.skipUnless(_APPTEST_AVAILABLE, "streamlit.testing.v1.AppTest not available")
@@ -346,6 +550,364 @@ class DocumentRepositoryUITests(unittest.TestCase):
         at.button(key=f"doc_repo_prepare_btn::{doc_id}").click().run(timeout=30)
         self.assertFalse(at.exception)
         self.assertEqual(len(at.download_button), 1)
+
+    # -----------------------------------------------------------------
+    # Phase 3: Upload tab
+    # -----------------------------------------------------------------
+    def _uploaders(self, at):
+        return [f for f in at.file_uploader if f.key and f.key.startswith("doc_repo_uploader_")]
+
+    def test_upload_tab_hidden_for_viewer(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Viewer Only", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual([t.label for t in at.tabs], ["Browse"])
+
+    def test_upload_tab_visible_for_admin(self):
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual([t.label for t in at.tabs], ["Browse", "Upload"])
+
+    def test_upload_tab_visible_for_contributor(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Contributor Cat", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, CONTRIBUTOR_EMAIL, documents_repo.LEVEL_CONTRIBUTE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, CONTRIBUTOR_EMAIL, documents_repo.ROLE_CONTRIBUTOR, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(CONTRIBUTOR_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual([t.label for t in at.tabs], ["Browse", "Upload"])
+
+    def test_upload_via_ui_succeeds(self):
+        documents_repo.create_category(ADMIN_EMAIL, "Upload Target", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+
+        self._uploaders(at)[0].set_value((("a.pdf", PDF_BYTES, "application/pdf"),)).run(timeout=30)
+        self.assertFalse(at.exception)
+
+        at.button(key="doc_repo_upload_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        success_texts = " ".join(s.value for s in at.success)
+        self.assertIn(documents_ui._escape_markdown("a.pdf"), success_texts)
+        self.assertIn("uploaded as", success_texts)
+
+    def test_upload_reports_specific_error_for_bad_file(self):
+        # st.file_uploader's own type= allowlist is enforced client-side
+        # by the real widget -- confirmed empirically: a .exe can't even
+        # be "selected" through set_value(), it raises before reaching
+        # this module at all. So the realistic bad-file case reachable
+        # through the actual UI is an ALLOWED extension whose content
+        # doesn't match it (caught by documents_repo's signature check,
+        # not by the widget).
+        documents_repo.create_category(ADMIN_EMAIL, "Upload Errors", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+
+        self._uploaders(at)[0].set_value((("spoofed.pdf", b"not actually a pdf", "application/pdf"),)).run(timeout=30)
+        at.button(key="doc_repo_upload_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        error_texts = " ".join(e.value for e in at.error)
+        self.assertIn(documents_ui._escape_markdown("spoofed.pdf"), error_texts)
+        self.assertIn("doesn't look like", error_texts)
+
+    def test_upload_tab_shows_duplicate_warning(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Dup Warn", secrets_getter=admin_secrets_getter)
+        documents_repo.add_document(ADMIN_EMAIL, cat_id, "Existing", PDF_BYTES, "existing.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_upload_category").set_value(cat_id).run(timeout=30)
+        self._uploaders(at)[0].set_value((("copy.pdf", PDF_BYTES, "application/pdf"),)).run(timeout=30)
+        self.assertFalse(at.exception)
+        warning_texts = " ".join(w.value for w in at.warning)
+        self.assertIn("Existing", warning_texts)
+
+    # -----------------------------------------------------------------
+    # Phase 3: detail panel -- Replace file, Edit details
+    # -----------------------------------------------------------------
+    def test_replace_creates_new_version_and_keeps_old(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Replace Test", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Replaceable", PDF_BYTES, "v1.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+
+        replace_uploaders = [f for f in at.file_uploader if f.key and f.key.startswith(f"doc_repo_replace_file::{doc_id}::")]
+        self.assertEqual(len(replace_uploaders), 1)
+        replace_uploaders[0].set_value(("v2.pdf", make_pdf(2000), "application/pdf")).run(timeout=30)
+        at.button(key=f"doc_repo_replace_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(len(detail["versions"]), 2)
+        self.assertEqual({v["filename"] for v in detail["versions"]}, {"v1.pdf", "v2.pdf"})
+
+    def test_edit_details_updates_metadata(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Edit Test", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Old Title", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        at.text_input(key=f"doc_repo_edit_title::{doc_id}").set_value("New Title").run(timeout=30)
+        at.button(key=f"doc_repo_save_details_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["title"], "New Title")
+
+    # -----------------------------------------------------------------
+    # Phase 3: detail panel -- Archive / Restore with confirmation
+    # -----------------------------------------------------------------
+    def test_archive_requires_confirmation_then_restore(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Archive Test", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "To Archive", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+
+        # First click only asks for confirmation -- the document must
+        # still be active.
+        at.button(key=f"doc_repo_archive_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["status"], documents_repo.STATUS_ACTIVE)
+        warning_texts = " ".join(w.value for w in at.warning)
+        self.assertIn("Archive this document", warning_texts)
+
+        # Confirming actually archives it.
+        at.button(key=f"doc_repo_confirm_archive_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["status"], documents_repo.STATUS_ARCHIVED)
+
+        # Restore brings it back.
+        at.toggle(key="doc_repo_show_archived").set_value(True).run(timeout=30)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        at.button(key=f"doc_repo_restore_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["status"], documents_repo.STATUS_ACTIVE)
+
+    def test_cancel_archive_leaves_document_active(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Cancel Archive", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Not Archived", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        at.button(key=f"doc_repo_archive_btn::{doc_id}").click().run(timeout=30)
+        at.button(key=f"doc_repo_cancel_archive_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["status"], documents_repo.STATUS_ACTIVE)
+
+    # -----------------------------------------------------------------
+    # Phase 3: "Show archived" toggle visibility and access scoping
+    # -----------------------------------------------------------------
+    def test_show_archived_toggle_hidden_for_viewer(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Toggle Viewer", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.toggle), 0)
+
+    def test_show_archived_toggle_hidden_for_contributor_without_manage(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Toggle Contributor", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, CONTRIBUTOR_EMAIL, documents_repo.LEVEL_CONTRIBUTE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, CONTRIBUTOR_EMAIL, documents_repo.ROLE_CONTRIBUTOR, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(CONTRIBUTOR_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.toggle), 0)
+
+    def test_show_archived_toggle_visible_for_manage_level(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Toggle Manage", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.toggle), 1)
+
+    def test_archived_document_hidden_from_viewer_even_with_toggle_absent(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Archived Hidden", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Archived Doc", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.archive_document(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.toggle), 0)  # no manage-level category -- no toggle at all
+        # The only document in the (one) category this viewer can see
+        # is archived, and they have no toggle to reveal it -- so the
+        # default "All categories" browse comes back with nothing.
+        self.assertIn("No documents yet.", [i.value for i in at.info])
+
+    # -----------------------------------------------------------------
+    # Fix-up 1: Markdown escaping, end-to-end through the detail panel
+    # -----------------------------------------------------------------
+    def test_malicious_title_not_rendered_as_image_or_link_in_detail_panel(self):
+        malicious_title = "![x](http://example.test/a.png) [click](http://example.test)"
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "XSS Test", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, malicious_title, PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter,
+        )
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+
+        markdown_texts = " ".join(m.value for m in at.markdown)
+        # The raw image/link syntax must never appear verbatim -- only
+        # its escaped form, which (confirmed in a real rendered
+        # browser -- see this file's module docstring) renders as
+        # plain text, never as an actual image or link.
+        self.assertNotIn("![x](http://example.test/a.png)", markdown_texts)
+        self.assertNotIn("[click](http://example.test)", markdown_texts)
+        self.assertIn(documents_ui._escape_markdown(malicious_title), markdown_texts)
+
+    def test_malicious_category_name_escaped_in_detail_panel(self):
+        malicious_name = "Cat **bold** [link](http://example.test)"
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, malicious_name, secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Doc", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+
+        # st.write(str) dispatches to st.markdown internally -- AppTest
+        # exposes it there, there is no separate at.write.
+        write_texts = " ".join(m.value for m in at.markdown)
+        self.assertNotIn("[link](http://example.test)", write_texts)
+        self.assertIn(documents_ui._escape_markdown(malicious_name), write_texts)
+
+    def test_malicious_upload_result_text_escaped(self):
+        documents_repo.create_category(ADMIN_EMAIL, "Upload XSS", secrets_getter=admin_secrets_getter)
+        malicious_name = "evil**.pdf"
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        self._uploaders(at)[0].set_value(((malicious_name, PDF_BYTES, "application/pdf"),)).run(timeout=30)
+        at.button(key="doc_repo_upload_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        success_texts = " ".join(s.value for s in at.success)
+        self.assertNotIn("evil**.pdf", success_texts)
+        self.assertIn(documents_ui._escape_markdown(malicious_name), success_texts)
+
+    # -----------------------------------------------------------------
+    # Fix-up 2: file position (not name/size) in upload title keys
+    # -----------------------------------------------------------------
+    def test_duplicate_name_and_size_files_do_not_collide(self):
+        documents_repo.create_category(ADMIN_EMAIL, "Dup Names", secrets_getter=admin_secrets_getter)
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+
+        data = make_pdf(2000)
+        self._uploaders(at)[0].set_value((
+            ("same.pdf", data, "application/pdf"),
+            ("same.pdf", data, "application/pdf"),
+        )).run(timeout=30)
+        self.assertFalse(at.exception)  # no duplicate-widget-key crash
+
+        title_inputs = [t for t in at.text_input if t.key and "doc_repo_upload_title::" in t.key]
+        self.assertEqual(len(title_inputs), 2)
+
+        at.button(key="doc_repo_upload_btn").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.success), 2)  # both files uploaded independently
+
+    # -----------------------------------------------------------------
+    # Fix-up 3: Replace resets its file_uploader after success
+    # -----------------------------------------------------------------
+    def test_replace_resets_uploader_after_success(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Replace Reset", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Doc", PDF_BYTES, "v1.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+
+        def _replace_uploaders():
+            return [f for f in at.file_uploader if f.key and f.key.startswith(f"doc_repo_replace_file::{doc_id}::")]
+
+        _replace_uploaders()[0].set_value(("v2.pdf", make_pdf(2000), "application/pdf")).run(timeout=30)
+        at.button(key=f"doc_repo_replace_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+
+        # Re-select the document: the Replace uploader must be a fresh,
+        # empty widget -- not still showing v2.pdf as selected.
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        after = _replace_uploaders()
+        self.assertEqual(len(after), 1)
+        self.assertIsNone(after[0].value)
+
+    # -----------------------------------------------------------------
+    # Fix-up 4: duplicate-content check is cached per selected file
+    # -----------------------------------------------------------------
+    def test_duplicate_check_cached_across_unrelated_reruns(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Cache Dup", secrets_getter=admin_secrets_getter)
+        documents_repo.add_document(ADMIN_EMAIL, cat_id, "Existing", PDF_BYTES, "existing.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_upload_category").set_value(cat_id).run(timeout=30)
+
+        with mock.patch.object(documents_repo, "find_duplicate_by_sha256", wraps=documents_repo.find_duplicate_by_sha256) as mocked:
+            self._uploaders(at)[0].set_value((("copy.pdf", PDF_BYTES, "application/pdf"),)).run(timeout=30)
+            self.assertEqual(mocked.call_count, 1)
+
+            # An unrelated rerun (typing in the description box) must
+            # not re-hash the file or re-query the database.
+            at.text_area(key="doc_repo_upload_description").set_value("some notes").run(timeout=30)
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_duplicate_check_recomputes_when_category_changes(self):
+        # Note: Selectbox.options in AppTest returns the *formatted*
+        # display labels (category names here), not the raw category
+        # ID -- set_value() needs the raw ID, so both category IDs are
+        # captured directly from create_category()'s return value
+        # rather than derived from .options.
+        cat_a = documents_repo.create_category(ADMIN_EMAIL, "Cache Dup A", secrets_getter=admin_secrets_getter)
+        cat_b = documents_repo.create_category(ADMIN_EMAIL, "Cache Dup B", secrets_getter=admin_secrets_getter)
+        documents_repo.add_document(ADMIN_EMAIL, cat_a, "Existing", PDF_BYTES, "existing.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_upload_category").set_value(cat_a).run(timeout=30)
+
+        with mock.patch.object(documents_repo, "find_duplicate_by_sha256", wraps=documents_repo.find_duplicate_by_sha256) as mocked:
+            self._uploaders(at)[0].set_value((("copy.pdf", PDF_BYTES, "application/pdf"),)).run(timeout=30)
+            self.assertFalse(at.exception)
+            self.assertEqual(mocked.call_count, 1)
+            warning_texts = " ".join(w.value for w in at.warning)
+            self.assertIn("Existing", warning_texts)
+
+            at.selectbox(key="doc_repo_upload_category").set_value(cat_a).run(timeout=30)
+            self.assertEqual(mocked.call_count, 1)  # same category, same file -- still cached
+
+            at.selectbox(key="doc_repo_upload_category").set_value(cat_b).run(timeout=30)
+            self.assertFalse(at.exception)
+            self.assertEqual(mocked.call_count, 2)  # category changed -- recomputed
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ Run with:
 or:
     pytest test_documents_repo.py -v
 """
+import hashlib
 import io
 import os
 import sqlite3
@@ -470,6 +471,79 @@ class ArchiveRestoreTests(TempDbTestCase):
 
 
 # ---------------------------------------------------------------------------
+# list_documents()'s archived-visibility rule: manage-level (or admin)
+# only -- view/contribute access never grants archived rows.
+# ---------------------------------------------------------------------------
+class ArchivedListingAccessTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Archived Access", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.active_id = dr.add_document(
+            ADMIN, self.category_id, "Active Doc", make_pdf(), "active.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.archived_id = dr.add_document(
+            ADMIN, self.category_id, "Archived Doc", make_pdf(), "archived.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        dr.archive_document(ADMIN, self.archived_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_explicit_archived_denied_for_viewer_with_category_id(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.list_documents(VIEWER, category_id=self.category_id, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_explicit_archived_denied_for_contributor_with_category_id(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.list_documents(CONTRIBUTOR, category_id=self.category_id, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_explicit_archived_allowed_for_manage_level(self):
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        docs = dr.list_documents(VIEWER, category_id=self.category_id, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in docs], [self.archived_id])
+
+    def test_explicit_archived_allowed_for_admin(self):
+        docs = dr.list_documents(ADMIN, category_id=self.category_id, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in docs], [self.archived_id])
+
+    def test_mixed_status_none_hides_archived_from_viewer_but_shows_active(self):
+        docs = dr.list_documents(VIEWER, category_id=self.category_id, status=None, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in docs], [self.active_id])
+
+    def test_mixed_status_none_hides_archived_from_contributor_but_shows_active(self):
+        docs = dr.list_documents(CONTRIBUTOR, category_id=self.category_id, status=None, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in docs], [self.active_id])
+
+    def test_mixed_status_none_shows_both_for_manage_level(self):
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        docs = dr.list_documents(VIEWER, category_id=self.category_id, status=None, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual({d["id"] for d in docs}, {self.active_id, self.archived_id})
+
+    def test_unscoped_archived_browse_empty_for_non_manage_user(self):
+        # VIEWER has view access (not manage) on the only category with
+        # an archived document -- an unscoped browse for archived
+        # documents must come back empty, not an error.
+        docs = dr.list_documents(VIEWER, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(docs, [])
+
+    def test_unscoped_archived_browse_narrows_to_manage_level_categories(self):
+        other_category = dr.create_category(ADMIN, "No Manage Here", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, other_category, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        other_doc = dr.add_document(ADMIN, other_category, "Other Doc", make_pdf(), "other.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.archive_document(ADMIN, other_doc, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        docs = dr.list_documents(VIEWER, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in docs], [self.archived_id])
+
+    def test_unknown_user_cannot_see_archived_anywhere(self):
+        docs = dr.list_documents(OUTSIDER, status=dr.STATUS_ARCHIVED, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(docs, [])
+
+
+# ---------------------------------------------------------------------------
 # Search / filters / pagination / blob isolation
 # ---------------------------------------------------------------------------
 class SearchFilterPaginationTests(TempDbTestCase):
@@ -695,6 +769,93 @@ class IsAdminTests(unittest.TestCase):
     def test_malformed_db_path_never_raises(self):
         # A directory can never be opened as a SQLite file.
         self.assertFalse(dr.is_admin(OUTSIDER, db_path=tempfile.mkdtemp()))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 read-only helpers: get_access_level, categories_with_min_level
+# ---------------------------------------------------------------------------
+class AccessHelperTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.cat_a = dr.create_category(ADMIN, "Category A", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.cat_b = dr.create_category(ADMIN, "Category B", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.cat_a, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.cat_b, CONTRIBUTOR, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_get_access_level_admin(self):
+        self.assertEqual(dr.get_access_level(ADMIN, self.cat_a, db_path=self.db_path, secrets_getter=self.secrets_getter), "admin")
+
+    def test_get_access_level_contributor(self):
+        self.assertEqual(dr.get_access_level(CONTRIBUTOR, self.cat_a, db_path=self.db_path, secrets_getter=self.secrets_getter), dr.LEVEL_CONTRIBUTE)
+
+    def test_get_access_level_none_for_no_access(self):
+        self.assertIsNone(dr.get_access_level(OUTSIDER, self.cat_a, db_path=self.db_path, secrets_getter=self.secrets_getter))
+
+    def test_get_access_level_empty_actor_returns_none(self):
+        self.assertIsNone(dr.get_access_level("", self.cat_a, db_path=self.db_path, secrets_getter=self.secrets_getter))
+
+    def test_get_access_level_writes_no_audit_row(self):
+        before = len(audit_rows(self.db_path))
+        dr.get_access_level(CONTRIBUTOR, self.cat_a, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.get_access_level(OUTSIDER, self.cat_a, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path)), before)
+
+    def test_categories_with_min_level_admin_sees_all(self):
+        cats = dr.categories_with_min_level(ADMIN, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual({c["id"] for c in cats}, {self.cat_a, self.cat_b})
+
+    def test_categories_with_min_level_filters_by_level(self):
+        cats = dr.categories_with_min_level(CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual({c["id"] for c in cats}, {self.cat_a})
+
+    def test_categories_with_min_level_empty_for_no_qualifying_category(self):
+        cats = dr.categories_with_min_level(CONTRIBUTOR, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(cats, [])
+
+    def test_categories_with_min_level_empty_for_unknown_user(self):
+        cats = dr.categories_with_min_level(OUTSIDER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(cats, [])
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 read-only helper: find_duplicate_by_sha256
+# ---------------------------------------------------------------------------
+class DuplicateDetectionTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.category_id = dr.create_category(ADMIN, "Dupes", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.category_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.data = make_pdf()
+        self.sha256 = hashlib.sha256(self.data).hexdigest()
+        self.doc_id = dr.add_document(
+            ADMIN, self.category_id, "Original", self.data, "a.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+
+    def test_finds_matching_active_document(self):
+        dup = dr.find_duplicate_by_sha256(ADMIN, self.category_id, self.sha256, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup["id"], self.doc_id)
+
+    def test_no_match_for_different_hash(self):
+        other_hash = hashlib.sha256(b"different content").hexdigest()
+        dup = dr.find_duplicate_by_sha256(ADMIN, self.category_id, other_hash, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNone(dup)
+
+    def test_no_match_once_archived(self):
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dup = dr.find_duplicate_by_sha256(ADMIN, self.category_id, self.sha256, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNone(dup)
+
+    def test_viewer_with_access_can_check(self):
+        dup = dr.find_duplicate_by_sha256(VIEWER, self.category_id, self.sha256, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertIsNotNone(dup)
+
+    def test_outsider_denied(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.find_duplicate_by_sha256(OUTSIDER, self.category_id, self.sha256, db_path=self.db_path, secrets_getter=self.secrets_getter)
 
 
 # ---------------------------------------------------------------------------
