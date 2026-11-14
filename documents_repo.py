@@ -1309,11 +1309,12 @@ def _check_list_documents_access(conn, actor_email: str, is_admin: bool, categor
 def _resolve_date_filter_bound(value: str, *, is_upper_bound: bool) -> str:
     """Normalizes a date_from/date_to filter value into something
     directly, lexicographically comparable against this module's
-    stored timestamp columns (created_at, ts -- always full UTC
-    ISO-8601 strings, see _now()). Shared by _list_documents_filter()
-    and _list_audit_log_filter(), so list_documents()/count_documents()
-    and list_audit_log()/count_audit_log() all accept the same two
-    input shapes the same way.
+    stored timestamp columns (document_versions.uploaded_at, ts --
+    always full UTC ISO-8601 strings, see _now()). Shared by
+    _list_documents_filter() and _list_audit_log_filter(), so
+    list_documents()/count_documents() and
+    list_audit_log()/count_audit_log() all accept the same two input
+    shapes the same way.
 
     Accepts either:
     - A bare calendar date ("2026-11-13") -- the original, unchanged
@@ -1391,10 +1392,10 @@ def _list_documents_filter(
         clauses.append("v.extension = ?")
         params.append(file_type.lower().lstrip("."))
     if date_from:
-        clauses.append("d.created_at >= ?")
+        clauses.append("v.uploaded_at >= ?")
         params.append(_resolve_date_filter_bound(date_from, is_upper_bound=False))
     if date_to:
-        clauses.append("d.created_at < ?")
+        clauses.append("v.uploaded_at < ?")
         params.append(_resolve_date_filter_bound(date_to, is_upper_bound=True))
     return clauses, params
 
@@ -1423,14 +1424,19 @@ def list_documents(
     'archived' for only archived). search escapes % and _ so they're
     matched literally rather than as LIKE wildcards.
 
-    date_from/date_to each accept either of two shapes (see
-    _resolve_date_filter_bound()):
+    date_from/date_to filter on the CURRENT version's upload time
+    (document_versions.uploaded_at, joined as v -- the same timestamp
+    the "Uploaded" column and these filters' "Uploaded from/to" labels
+    in documents_ui.py refer to), not when the document row itself was
+    first created -- replacing a document's file moves it forward to
+    the new version's upload time. Each bound accepts either of two
+    shapes (see _resolve_date_filter_bound()):
     - A bare calendar date ("2026-11-13"): a whole UTC calendar day,
       both bounds inclusive of every row anywhere in that day -- not a
       literal string comparison against the bound you passed.
-      created_at is a full timestamp (see _now()), so "created_at >=
+      uploaded_at is a full timestamp (see _now()), so "uploaded_at >=
       date_from" alone already includes that whole day; date_to
-      instead compares "created_at < date_to + 1 day" so it includes
+      instead compares "uploaded_at < date_to + 1 day" so it includes
       every moment of its own day and nothing from the day after (same
       approach as list_audit_log()'s date_to).
     - A full ISO-8601 timestamp with a UTC offset
@@ -1500,9 +1506,10 @@ def count_documents(
     fact the exact same filter-building and access-check code, factored
     out into _list_documents_filter()/_check_list_documents_access() so
     the two can never silently disagree -- but returns just a row
-    count. date_from/date_to accept the same two shapes list_documents()
-    does (a bare calendar date, or a full ISO-8601 timestamp with a UTC
-    offset -- see its docstring and _resolve_date_filter_bound()).
+    count. date_from/date_to filter on the CURRENT version's upload
+    time, same as list_documents(), and accept the same two shapes (a
+    bare calendar date, or a full ISO-8601 timestamp with a UTC offset
+    -- see its docstring and _resolve_date_filter_bound()).
     Meant for places (like the category list's per-category
     counts) that only need a number: calling list_documents() with a
     huge page_size just to take len() of the result means fetching and

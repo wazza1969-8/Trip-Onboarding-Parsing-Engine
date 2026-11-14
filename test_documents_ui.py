@@ -431,7 +431,7 @@ class ViewerTimeZoneTests(unittest.TestCase):
         self.assertEqual(span, timedelta(hours=25))
 
     def test_dst_transition_day_still_correctly_bounds_a_document(self):
-        # A document created at 1:30am EDT on 2026-11-01 -- during the
+        # A document uploaded at 1:30am EDT on 2026-11-01 -- during the
         # repeated hour -- must still be found when filtering for that
         # local day, through the full list_documents() call. Uses its
         # own temp DB rather than the shared DEFAULT_DB_PATH, since
@@ -444,8 +444,10 @@ class ViewerTimeZoneTests(unittest.TestCase):
             date_to = documents_ui._resolve_date_filter_to(date(2026, 11, 1), tz)
             cat_id = documents_repo.create_category(ADMIN_EMAIL, "DST Day", db_path=db_path, secrets_getter=admin_secrets_getter)
             doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "DST Doc", PDF_BYTES, "a.pdf", db_path=db_path, secrets_getter=admin_secrets_getter)
+            # The filter reads the CURRENT VERSION's uploaded_at, not
+            # documents.created_at -- see _list_documents_filter().
             conn = sqlite3.connect(db_path)
-            conn.execute("UPDATE documents SET created_at = ? WHERE id = ?", ("2026-11-01T05:30:00+00:00", doc_id))
+            conn.execute("UPDATE document_versions SET uploaded_at = ? WHERE document_id = ?", ("2026-11-01T05:30:00+00:00", doc_id))
             conn.commit()
             conn.close()
             results = documents_repo.list_documents(

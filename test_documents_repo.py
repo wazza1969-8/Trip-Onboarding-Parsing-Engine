@@ -874,14 +874,29 @@ class BrowseDateFilterTests(TempDbTestCase):
         self.category_id = dr.create_category(ADMIN, "Date Filter", db_path=self.db_path, secrets_getter=self.secrets_getter)
 
     def _insert_document_with_created_at(self, created_at: str) -> str:
+        # date_from/date_to filter on the CURRENT version's uploaded_at
+        # (see _list_documents_filter()), not the document row's own
+        # created_at -- so this also inserts a real document_versions
+        # row with uploaded_at set to the same timestamp, and points
+        # current_version_id at it, or a NULL current_version_id would
+        # make v.uploaded_at NULL and the row would never match any
+        # date filter at all.
         document_id = uuid.uuid4().hex
+        version_id = uuid.uuid4().hex
         conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """INSERT INTO document_versions (
+                id, document_id, version_no, filename, extension, mime_type,
+                size_bytes, sha256, storage_key, change_note, uploaded_at, uploaded_by
+            ) VALUES (?, ?, 1, 'a.pdf', 'pdf', 'application/pdf', 0, '', '', '', ?, ?)""",
+            (version_id, document_id, created_at, ADMIN),
+        )
         conn.execute(
             """INSERT INTO documents (
                 id, category_id, title, description, keywords, status,
                 current_version_id, created_at, created_by, updated_at, updated_by
-            ) VALUES (?, ?, ?, '', '', ?, NULL, ?, ?, ?, ?)""",
-            (document_id, self.category_id, "Dated Doc", dr.STATUS_ACTIVE, created_at, ADMIN, created_at, ADMIN),
+            ) VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)""",
+            (document_id, self.category_id, "Dated Doc", dr.STATUS_ACTIVE, version_id, created_at, ADMIN, created_at, ADMIN),
         )
         conn.commit()
         conn.close()
@@ -993,6 +1008,37 @@ class BrowseDateFilterTests(TempDbTestCase):
     def test_naive_timestamp_without_utc_offset_raises(self):
         with self.assertRaises(ValueError):
             dr.list_documents(ADMIN, date_from="2026-11-13T05:00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_date_filter_follows_current_version_not_original_creation(self):
+        # The date filter reads the CURRENT version's uploaded_at, not
+        # documents.created_at -- replacing a document's file moves it
+        # forward to the new version's upload time.
+        doc_id = self._insert_document_with_created_at("2026-01-01T00:00:00+00:00")
+        dr.replace_document(ADMIN, doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        # Pin the new (current) version's upload time to a known,
+        # later date so this test doesn't depend on "now".
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE document_versions SET uploaded_at = ? WHERE document_id = ? AND version_no = 2",
+            ("2026-11-13T12:00:00+00:00", doc_id),
+        )
+        conn.commit()
+        conn.close()
+
+        # A date_from after the original creation date but before the
+        # replacement's upload time must still include it.
+        results = dr.list_documents(ADMIN, date_from="2026-06-01", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in results], [doc_id])
+        count = dr.count_documents(ADMIN, date_from="2026-06-01", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+        # A date_to before the replacement's upload time (but well
+        # after creation) must exclude it -- proving the filter
+        # follows the current version, not the creation date.
+        results = dr.list_documents(ADMIN, date_to="2026-11-12", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+        count = dr.count_documents(ADMIN, date_to="2026-11-12", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 0)
 
 
 # ---------------------------------------------------------------------------
