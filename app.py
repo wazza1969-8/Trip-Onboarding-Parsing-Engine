@@ -2292,7 +2292,45 @@ TILES = TASKS + ["Document Repository"] if _show_document_repository_tile else T
 # ---------------------------------------------------------------------------
 if st.session_state["task"] is None:
     st.subheader("What would you like to do?")
-    cols = st.columns(len(TILES))
+    # Scoped to this screen only via the "landing_tiles" container key below
+    # (-> a .st-key-landing_tiles class on its wrapper), so it can't affect
+    # st.columns()/st.container(border=True) anywhere else in the app.
+    #
+    # Each tile's column stretches to the row's height by default (Streamlit
+    # already sets align-items: stretch on the column row) -- but a column's
+    # own content (the bordered box, or the disabled tile's markup+button)
+    # is sized to fit itself, not stretched to fill that extra height. This
+    # makes every layer in between a flex column too, so the stretch reaches
+    # all the way down to the bordered box, then pins each "Select" button
+    # to the bottom with margin-top: auto rather than a fixed height, so
+    # nothing clips if a description is ever longer than it is today.
+    st.markdown(
+        """
+        <style>
+        .st-key-landing_tiles [data-testid="stColumn"] {
+            display: flex;
+            flex-direction: column;
+        }
+        .st-key-landing_tiles [data-testid="stColumn"] > [data-testid="stVerticalBlock"] {
+            flex: 1 1 auto;
+            display: flex;
+            flex-direction: column;
+        }
+        .st-key-landing_tiles [data-testid="stLayoutWrapper"] {
+            flex: 1 1 auto;
+        }
+        .st-key-landing_tiles [data-testid="stLayoutWrapper"] [data-testid="stVerticalBlock"] {
+            flex: 1 1 auto;
+        }
+        .st-key-landing_tiles [class*="st-key-select_"] {
+            margin-top: auto;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    tiles_container = st.container(key="landing_tiles")
+    cols = tiles_container.columns(len(TILES))
     for col, task_name in zip(cols, TILES):
         with col:
             if task_name in DISABLED_TASKS:
