@@ -960,17 +960,20 @@ def _can_see_document_repository(actor_email: str | None) -> bool:
     documents_repo.is_admin() Turso round trip (two queries) just to
     render the landing screen's existing tiles.
 
-    documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED is a master switch,
-    checked fresh every call (never cached) before anything else: when
-    it's False, this returns False for EVERY actor, administrators
+    documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS is an
+    allowlist, checked fresh every call (never cached) before anything
+    else: when it's not None, actor_email must match one of its emails
+    (case-insensitively) or this returns False, administrators
     included, with no exceptions and no per-category carve-out. Read
-    as documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED (an attribute
-    lookup at call time, not a bare imported name) so a test can patch
-    it. When it's True, behavior is exactly what it was before this
-    switch existed -- admins, or anyone DOC_REPO_ENABLED and
-    per-category access already covers.
+    as documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS (an
+    attribute lookup at call time, not a bare imported name) so a test
+    can patch it. When it's None, behavior is exactly what it was
+    before this allowlist existed -- admins, or anyone DOC_REPO_ENABLED
+    and per-category access already covers. For an allowed email, the
+    rest of this function's logic (admin check, DOC_REPO_ENABLED,
+    grants, cache) runs exactly as it would with no allowlist at all.
 
-    The result (when the switch is on) is cached in st.session_state
+    The result (for an allowed actor) is cached in st.session_state
     (per-session, never shared across users/visitors) keyed to
     actor_email, and reused for up to
     _DOCUMENT_REPO_VISIBILITY_TTL_SECONDS -- a False result is cached
@@ -981,8 +984,10 @@ def _can_see_document_repository(actor_email: str | None) -> bool:
     """
     if not _DOCUMENTS_REPO_AVAILABLE or not actor_email:
         return False
-    if not documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED:
-        return False
+    allowed_emails = documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS
+    if allowed_emails is not None:
+        if actor_email.strip().lower() not in {e.strip().lower() for e in allowed_emails}:
+            return False
 
     cached = st.session_state.get("_doc_repo_tile_visibility_cache")
     now = _cache_clock()

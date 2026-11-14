@@ -460,14 +460,17 @@ class ViewerTimeZoneTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_APPTEST_AVAILABLE, "streamlit.testing.v1.AppTest not available")
-class DocumentRepositoryTileKillSwitchTests(unittest.TestCase):
-    """documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED -- the master
-    switch app.py's _can_see_document_repository() checks before
-    anything else. Deliberately does NOT patch the flag in setUp (the
-    way DocumentRepositoryUITests below does, so its tests can reach
-    the screen) -- these tests are specifically about the switch's
-    own default and its effect, so they need the real, unpatched
-    default (False) available."""
+class DocumentRepositoryTileAllowlistTests(unittest.TestCase):
+    """documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS -- the
+    allowlist app.py's _can_see_document_repository() checks before
+    anything else. Deliberately does NOT patch it in setUp (the way
+    DocumentRepositoryUITests below does, so its tests can reach the
+    screen regardless of email) -- these tests are specifically about
+    the allowlist's own default and its effect, so they need the
+    real, unpatched default (only walter.taylor@jepp.com) available."""
+
+    ALLOWED_EMAIL = "walter.taylor@jepp.com"
+    OTHER_ADMIN_EMAIL = "other-admin@example.test"
 
     def setUp(self):
         _clear_document_repo_tables()
@@ -475,31 +478,73 @@ class DocumentRepositoryTileKillSwitchTests(unittest.TestCase):
     def tearDown(self):
         _clear_document_repo_tables()
 
-    def test_tile_not_shown_for_admin_with_default_disabled(self):
-        self.assertFalse(documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED)
+    def test_allowed_admin_sees_tile_by_default(self):
+        self.assertIn(self.ALLOWED_EMAIL, documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS)
         at = AppTest.from_file("app.py")
-        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
-        at.session_state["_test_actor_email"] = ADMIN_EMAIL
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = self.ALLOWED_EMAIL
+        at.session_state["_test_actor_email"] = self.ALLOWED_EMAIL
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
+        self.assertIn("select_Document Repository", select_keys)
+
+    def test_different_admin_does_not_see_tile_by_default(self):
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = self.OTHER_ADMIN_EMAIL
+        at.session_state["_test_actor_email"] = self.OTHER_ADMIN_EMAIL
         at.run(timeout=30)
         self.assertFalse(at.exception)
         select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
         self.assertNotIn("select_Document Repository", select_keys)
 
-    def test_forced_task_returns_admin_to_landing_screen_with_default_disabled(self):
+    def test_non_admin_with_category_access_does_not_see_tile_by_default(self):
+        cat_id = documents_repo.create_category(
+            ADMIN_EMAIL, "Allowlist Check", secrets_getter=admin_secrets_getter,
+        )
+        documents_repo.grant_category_access(
+            ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW,
+            secrets_getter=admin_secrets_getter,
+        )
         at = AppTest.from_file("app.py")
-        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
-        at.session_state["_test_actor_email"] = ADMIN_EMAIL
+        at.secrets["DOC_REPO_ENABLED"] = "true"
+        at.session_state["_test_actor_email"] = VIEWER_EMAIL
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
+        self.assertNotIn("select_Document Repository", select_keys)
+
+    def test_forced_task_returns_non_allowed_user_to_landing_screen_by_default(self):
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = self.OTHER_ADMIN_EMAIL
+        at.session_state["_test_actor_email"] = self.OTHER_ADMIN_EMAIL
         at.session_state["task"] = "Document Repository"
         at.run(timeout=30)
         self.assertFalse(at.exception)
         self.assertIsNone(at.session_state["task"])
         self.assertEqual([s.value for s in at.subheader], ["What would you like to do?"])
 
-    def test_tile_shown_for_admin_when_patched_enabled(self):
-        with mock.patch.object(documents_ui, "DOCUMENT_REPOSITORY_TILE_ENABLED", True):
+    def test_allowlist_matches_case_insensitively(self):
+        # The configured allowlist entry itself may be typed in any
+        # case -- the comparison in _can_see_document_repository()
+        # lowercases both sides, so an upper-cased entry still matches
+        # the (already-lowercased) signed-in actor email.
+        with mock.patch.object(
+            documents_ui, "DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS",
+            frozenset({self.ALLOWED_EMAIL.upper()}),
+        ):
             at = AppTest.from_file("app.py")
-            at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
-            at.session_state["_test_actor_email"] = ADMIN_EMAIL
+            at.secrets["DOC_REPO_ADMIN_EMAILS"] = self.ALLOWED_EMAIL
+            at.session_state["_test_actor_email"] = self.ALLOWED_EMAIL
+            at.run(timeout=30)
+            self.assertFalse(at.exception)
+            select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
+            self.assertIn("select_Document Repository", select_keys)
+
+    def test_allowlist_patched_to_none_restores_old_behavior_for_other_admin(self):
+        with mock.patch.object(documents_ui, "DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS", None):
+            at = AppTest.from_file("app.py")
+            at.secrets["DOC_REPO_ADMIN_EMAILS"] = self.OTHER_ADMIN_EMAIL
+            at.session_state["_test_actor_email"] = self.OTHER_ADMIN_EMAIL
             at.run(timeout=30)
             self.assertFalse(at.exception)
             select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
@@ -510,13 +555,14 @@ class DocumentRepositoryTileKillSwitchTests(unittest.TestCase):
 class DocumentRepositoryUITests(unittest.TestCase):
     def setUp(self):
         _clear_document_repo_tables()
-        # The tile is hidden for everyone by default (see
-        # documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED) -- this whole
-        # class exercises the Document Repository screen itself, so it
-        # needs the tile actually reachable; the per-user/per-category
-        # visibility rules these tests check are unchanged by this
-        # patch, only the master switch is.
-        self._tile_enabled_patcher = mock.patch.object(documents_ui, "DOCUMENT_REPOSITORY_TILE_ENABLED", True)
+        # The tile is restricted to one allowlisted email by default
+        # (see documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS) --
+        # this whole class exercises the Document Repository screen
+        # itself for a variety of emails (admin, contributor, viewer,
+        # outsider), so it needs the allowlist removed; the
+        # per-user/per-category visibility rules these tests check are
+        # unchanged by this patch, only the allowlist is.
+        self._tile_enabled_patcher = mock.patch.object(documents_ui, "DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS", None)
         self._tile_enabled_patcher.start()
 
     def tearDown(self):

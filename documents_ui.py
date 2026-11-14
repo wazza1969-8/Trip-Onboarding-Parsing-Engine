@@ -55,13 +55,15 @@ from PIL import Image
 
 import documents_repo
 
-# Master switch for the Document Repository landing-screen tile, read
-# at run time by app.py as documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED
-# (not imported as a bare name), so tests can patch it. Set to True to
-# show the tile again, to administrators and to other users per the
-# existing per-category access rules -- this flag only ever narrows
-# that visibility further, never widens it.
-DOCUMENT_REPOSITORY_TILE_ENABLED = False
+# Allowlist for the Document Repository landing-screen tile and screen,
+# read at run time by app.py as
+# documents_ui.DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS (not imported as a
+# bare name), so tests can patch it. The tile (and screen) is shown ONLY
+# to these emails. Set to None to remove the restriction, so the
+# existing rules (administrators, DOC_REPO_ENABLED, and per-category
+# access) apply to everyone again. This only ever narrows visibility
+# further, never widens it.
+DOCUMENT_REPOSITORY_TILE_ALLOWED_EMAILS = frozenset({"walter.taylor@jepp.com"})
 
 PAGE_SIZE = 25
 
