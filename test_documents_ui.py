@@ -74,7 +74,7 @@ import sys
 import unittest
 import zipfile
 import zlib
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest import mock
 
 import documents_repo
@@ -600,6 +600,12 @@ class DocumentRepositoryUITests(unittest.TestCase):
         # (same bug class as the Admin audit log's date_to): "Uploaded
         # to" defaulting to today must not exclude a document created
         # moments ago today.
+        #
+        # created_at is stamped in UTC (see _now()), so this must use
+        # the UTC date, not local date.today() -- otherwise this test
+        # itself is spuriously flaky for a few hours each day, in any
+        # timezone behind UTC, whenever local and UTC disagree on what
+        # "today" is.
         cat_id = documents_repo.create_category(ADMIN_EMAIL, "Date Filter UI", secrets_getter=admin_secrets_getter)
         documents_repo.add_document(
             ADMIN_EMAIL, cat_id, "Uploaded Today", PDF_BYTES, "today.pdf",
@@ -607,7 +613,7 @@ class DocumentRepositoryUITests(unittest.TestCase):
         )
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
-        at.date_input(key="doc_repo_date_to").set_value(date.today()).run(timeout=30)
+        at.date_input(key="doc_repo_date_to").set_value(datetime.now(timezone.utc).date()).run(timeout=30)
         self.assertFalse(at.exception)
         all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
         self.assertIn("Uploaded Today", all_titles)
@@ -1463,12 +1469,18 @@ class DocumentRepositoryUITests(unittest.TestCase):
         # to today must not exclude rows created moments ago today --
         # ts is a full timestamp, so a naive "ts <= today" would have
         # excluded everything from today.
+        #
+        # ts is stamped in UTC (see _now()), so this must use the UTC
+        # date, not local date.today() -- otherwise this test itself
+        # is spuriously flaky for a few hours each day, in any
+        # timezone behind UTC, whenever local and UTC disagree on what
+        # "today" is.
         documents_repo.create_category(ADMIN_EMAIL, "Audit Today", secrets_getter=admin_secrets_getter)
 
         at = self._at_as(ADMIN_EMAIL)
         at = self._select_document_repository(at)
         at = self._select_admin_section(at, "Audit Log")
-        at.date_input(key="doc_repo_admin_audit_date_to").set_value(date.today()).run(timeout=30)
+        at.date_input(key="doc_repo_admin_audit_date_to").set_value(datetime.now(timezone.utc).date()).run(timeout=30)
         self.assertFalse(at.exception)
 
         audit_tables = [df for df in at.dataframe if "Action" in df.value.columns]
