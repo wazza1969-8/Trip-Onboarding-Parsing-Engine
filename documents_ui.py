@@ -304,7 +304,7 @@ def render_document_repository(actor_email: str) -> None:
         try:
             existing = documents_repo.list_categories(actor_email, secrets_getter=secrets_getter)
             if not existing:
-                documents_repo.seed_default_categories(actor_email=actor_email)
+                documents_repo.seed_default_categories(actor_email=actor_email, secrets_getter=secrets_getter)
         except Exception:
             st.error("Couldn't set up the document repository's default categories.")
             return

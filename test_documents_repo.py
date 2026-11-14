@@ -1455,12 +1455,8 @@ _AUTHORIZATION_REVIEWED_FUNCTIONS = {
     # another identity's secret/role (is_admin*) or more than the
     # caller's own access (get_access_level, categories_with_min_level).
     "is_admin", "is_admin_via_secret", "get_access_level", "categories_with_min_level",
-    # Deliberately NOT gated at the function level -- a one-time
-    # bootstrap helper not wired into any call site; see its own
-    # docstring. Reviewed and accepted as a documented exception, not
-    # an oversight.
-    "seed_default_categories",
     # Admin only.
+    "seed_default_categories",
     "create_category", "rename_category", "reorder_categories",
     "deactivate_category", "reactivate_category",
     "grant_category_access", "revoke_category_access", "list_category_access",
@@ -1512,18 +1508,38 @@ class AuthorizationAllowlistTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class SeedDefaultCategoriesTests(TempDbTestCase):
     def test_seeds_nine_categories_and_is_idempotent(self):
-        dr.seed_default_categories(db_path=self.db_path)
-        dr.seed_default_categories(db_path=self.db_path)
+        dr.seed_default_categories(actor_email=ADMIN, db_path=self.db_path, secrets_getter=admin_secrets())
+        dr.seed_default_categories(actor_email=ADMIN, db_path=self.db_path, secrets_getter=admin_secrets())
         cats = dr.list_categories(ADMIN, db_path=self.db_path, secrets_getter=admin_secrets())
         self.assertEqual(len(cats), 9)
         self.assertEqual({c["name"] for c in cats}, set(dr.DEFAULT_CATEGORIES))
 
     def test_does_not_overwrite_existing_categories(self):
         dr.create_category(ADMIN, "Pre-existing Category", db_path=self.db_path, secrets_getter=admin_secrets())
-        dr.seed_default_categories(db_path=self.db_path)
+        dr.seed_default_categories(actor_email=ADMIN, db_path=self.db_path, secrets_getter=admin_secrets())
         cats = dr.list_categories(ADMIN, db_path=self.db_path, secrets_getter=admin_secrets())
         self.assertEqual(len(cats), 1)
         self.assertEqual(cats[0]["name"], "Pre-existing Category")
+
+    def test_non_admin_denied(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.seed_default_categories(actor_email=OUTSIDER, db_path=self.db_path, secrets_getter=admin_secrets())
+
+    def test_non_admin_denial_is_audited(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.seed_default_categories(actor_email=OUTSIDER, db_path=self.db_path, secrets_getter=admin_secrets())
+        self.assertEqual(len(audit_rows(self.db_path, "seed_default_categories_denied")), 1)
+
+    def test_non_admin_denied_even_though_table_is_empty(self):
+        # The denial check must run before the "already seeded?" check
+        # -- a non-admin can't learn anything or trigger a write just
+        # by calling this on a fresh, empty database.
+        with self.assertRaises(dr.PermissionDenied):
+            dr.seed_default_categories(actor_email=OUTSIDER, db_path=self.db_path, secrets_getter=admin_secrets())
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM doc_categories").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
 
 
 if __name__ == "__main__":

@@ -638,20 +638,23 @@ class DatabaseBlobStore(DocumentStore):
 # ---------------------------------------------------------------------------
 # Categories
 # ---------------------------------------------------------------------------
-def seed_default_categories(db_path: Path = DEFAULT_DB_PATH, actor_email: str = "system") -> None:
+def seed_default_categories(actor_email: str, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> None:
     """Creates the nine categories in DEFAULT_CATEGORIES, but only if
-    doc_categories is currently empty -- safe to call more than once.
+    doc_categories is currently empty -- safe to call more than once,
+    and a second call never duplicates the first call's categories.
 
-    Not wired into any call site yet. It deliberately does not run
-    through the normal admin check every other mutation below does:
-    this is a one-time bootstrap step that, by definition, may run
-    before any doc_users row or DOC_REPO_ADMIN_EMAILS secret exists.
-    Whichever caller wires this in later (an init script, an admin
-    "reset categories" button) is responsible for only invoking it in
-    an already-authorized context.
+    Admin only, same as every other mutation in this module -- called
+    from documents_ui.py's render_document_repository() the first time
+    an admin opens the Document Repository screen and finds no
+    categories yet, so the screen isn't empty on day one. A non-admin
+    caller is denied (and that denial audited) exactly like any other
+    admin-only function here.
     """
+    actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)
     try:
+        if not _is_admin(conn, actor_email, secrets_getter):
+            _deny(conn, actor_email, "seed_default_categories")
         if conn.execute("SELECT COUNT(*) FROM doc_categories").fetchone()[0]:
             return
         now = _now()
