@@ -460,11 +460,67 @@ class ViewerTimeZoneTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_APPTEST_AVAILABLE, "streamlit.testing.v1.AppTest not available")
-class DocumentRepositoryUITests(unittest.TestCase):
+class DocumentRepositoryTileKillSwitchTests(unittest.TestCase):
+    """documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED -- the master
+    switch app.py's _can_see_document_repository() checks before
+    anything else. Deliberately does NOT patch the flag in setUp (the
+    way DocumentRepositoryUITests below does, so its tests can reach
+    the screen) -- these tests are specifically about the switch's
+    own default and its effect, so they need the real, unpatched
+    default (False) available."""
+
     def setUp(self):
         _clear_document_repo_tables()
 
     def tearDown(self):
+        _clear_document_repo_tables()
+
+    def test_tile_not_shown_for_admin_with_default_disabled(self):
+        self.assertFalse(documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED)
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
+        at.session_state["_test_actor_email"] = ADMIN_EMAIL
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
+        self.assertNotIn("select_Document Repository", select_keys)
+
+    def test_forced_task_returns_admin_to_landing_screen_with_default_disabled(self):
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
+        at.session_state["_test_actor_email"] = ADMIN_EMAIL
+        at.session_state["task"] = "Document Repository"
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertIsNone(at.session_state["task"])
+        self.assertEqual([s.value for s in at.subheader], ["What would you like to do?"])
+
+    def test_tile_shown_for_admin_when_patched_enabled(self):
+        with mock.patch.object(documents_ui, "DOCUMENT_REPOSITORY_TILE_ENABLED", True):
+            at = AppTest.from_file("app.py")
+            at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
+            at.session_state["_test_actor_email"] = ADMIN_EMAIL
+            at.run(timeout=30)
+            self.assertFalse(at.exception)
+            select_keys = [b.key for b in at.button if b.key and b.key.startswith("select_")]
+            self.assertIn("select_Document Repository", select_keys)
+
+
+@unittest.skipUnless(_APPTEST_AVAILABLE, "streamlit.testing.v1.AppTest not available")
+class DocumentRepositoryUITests(unittest.TestCase):
+    def setUp(self):
+        _clear_document_repo_tables()
+        # The tile is hidden for everyone by default (see
+        # documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED) -- this whole
+        # class exercises the Document Repository screen itself, so it
+        # needs the tile actually reachable; the per-user/per-category
+        # visibility rules these tests check are unchanged by this
+        # patch, only the master switch is.
+        self._tile_enabled_patcher = mock.patch.object(documents_ui, "DOCUMENT_REPOSITORY_TILE_ENABLED", True)
+        self._tile_enabled_patcher.start()
+
+    def tearDown(self):
+        self._tile_enabled_patcher.stop()
         _clear_document_repo_tables()
 
     @staticmethod

@@ -575,5 +575,52 @@ class UITests(unittest.TestCase):
         self.assertFalse(any(b.key == "wrview_edit_btn_0" for b in at.button))
 
 
+# ---------------------------------------------------------------------------
+# Landing screen: DISABLED_TASKS ("on hold" tiles) -- not specific to the
+# Weekly Report feature, but this is app.py's general landing-screen UI
+# test file. Flight Planning Parsing is the current member of
+# DISABLED_TASKS; these tests would apply to any task added to it.
+# ---------------------------------------------------------------------------
+@unittest.skipUnless(_APPTEST_AVAILABLE, "streamlit.testing.v1.AppTest not available")
+class DisabledTaskTests(unittest.TestCase):
+    def test_disabled_tile_renders_with_on_hold_banner(self):
+        at = AppTest.from_file("app.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        markdown_texts = " ".join(m.value for m in at.markdown)
+        self.assertIn("Getting It Done", markdown_texts)
+        self.assertIn("Flight Planning Parsing", markdown_texts)
+
+    def test_disabled_tile_select_button_is_disabled(self):
+        at = AppTest.from_file("app.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        select_btn = next(b for b in at.button if b.key == "select_Flight Planning Parsing")
+        self.assertTrue(select_btn.disabled)
+
+    def test_enabled_tiles_select_buttons_are_not_disabled(self):
+        # Sanity check alongside the above -- disabling Flight Planning
+        # Parsing must not have disabled the other tiles too.
+        at = AppTest.from_file("app.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        for key in ("select_Trip Preference Parsing", "select_Weekly Report"):
+            select_btn = next(b for b in at.button if b.key == key)
+            self.assertFalse(select_btn.disabled)
+
+    def test_forced_disabled_task_returns_to_landing_screen(self):
+        # A stale or forced st.session_state["task"] pointing at a
+        # disabled task must not keep showing that task's screen --
+        # the router re-check sends it back to the landing screen on
+        # the very next rerun, same as it already does for Document
+        # Repository when permission is lost mid-session.
+        at = AppTest.from_file("app.py")
+        at.session_state["task"] = "Flight Planning Parsing"
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertIsNone(at.session_state["task"])
+        self.assertTrue(any(h.value == "What would you like to do?" for h in at.subheader))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -630,7 +630,7 @@ TASK_DESCRIPTIONS = {
 # Tasks that are visible on the landing screen but not selectable yet --
 # rendered grayed-out with a diagonal "on hold" banner instead of a
 # working card. Remove a task from this set once it's ready to build.
-DISABLED_TASKS = set()
+DISABLED_TASKS = {"Flight Planning Parsing"}
 DISABLED_BANNER_TEXT = "Getting It Done"
 
 # Jeppesen ForeFlight brand: dark teal-to-navy gradient + logo, matching
@@ -960,15 +960,28 @@ def _can_see_document_repository(actor_email: str | None) -> bool:
     documents_repo.is_admin() Turso round trip (two queries) just to
     render the landing screen's existing tiles.
 
-    The result is cached in st.session_state (per-session, never
-    shared across users/visitors) keyed to actor_email, and reused
-    for up to _DOCUMENT_REPO_VISIBILITY_TTL_SECONDS -- a False result
-    is cached too, since an ordinary user reruns this just as often as
-    an admin does. Recomputed immediately if actor_email itself
-    changes (e.g. a different person signs in in the same browser
-    session) rather than waiting out a stale TTL for the wrong email.
+    documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED is a master switch,
+    checked fresh every call (never cached) before anything else: when
+    it's False, this returns False for EVERY actor, administrators
+    included, with no exceptions and no per-category carve-out. Read
+    as documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED (an attribute
+    lookup at call time, not a bare imported name) so a test can patch
+    it. When it's True, behavior is exactly what it was before this
+    switch existed -- admins, or anyone DOC_REPO_ENABLED and
+    per-category access already covers.
+
+    The result (when the switch is on) is cached in st.session_state
+    (per-session, never shared across users/visitors) keyed to
+    actor_email, and reused for up to
+    _DOCUMENT_REPO_VISIBILITY_TTL_SECONDS -- a False result is cached
+    too, since an ordinary user reruns this just as often as an admin
+    does. Recomputed immediately if actor_email itself changes (e.g. a
+    different person signs in in the same browser session) rather
+    than waiting out a stale TTL for the wrong email.
     """
     if not _DOCUMENTS_REPO_AVAILABLE or not actor_email:
+        return False
+    if not documents_ui.DOCUMENT_REPOSITORY_TILE_ENABLED:
         return False
 
     cached = st.session_state.get("_doc_repo_tile_visibility_cache")
@@ -2325,6 +2338,17 @@ if st.session_state["task"] is None:
         .st-key-landing_tiles [class*="st-key-select_"] {
             margin-top: auto;
         }
+        /* A disabled (DISABLED_TASKS) tile has no st.container(border=True)
+           -- its "Select" button sits directly in the column's own flex
+           block, with none of the bordered box's own ~16px padding between
+           content and edge that the enabled tiles get from their nested
+           stLayoutWrapper. Without this, a disabled tile's button lands
+           ~16px lower than the enabled tiles' buttons. Matching that same
+           padding here (scoped to exactly this case via :has()) re-aligns
+           it, without touching the enabled tiles' own layout at all. */
+        .st-key-landing_tiles [data-testid="stColumn"] > [data-testid="stVerticalBlock"]:not(:has([data-testid="stLayoutWrapper"])) {
+            padding-bottom: 16px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2382,10 +2406,15 @@ with col_title:
 
 task = st.session_state["task"]
 
-# Permission can change between page loads (e.g. an admin's access is
-# revoked mid-session) -- re-checked here, not just at selection time,
-# so a stale session can never keep showing this screen.
+# Permission/availability can change between page loads (e.g. an
+# admin's access is revoked mid-session, or a task goes on hold) --
+# re-checked here, not just at selection time, so a stale session (or
+# one with "task" forced directly in st.session_state) can never keep
+# showing a screen it shouldn't.
 if task == "Document Repository" and not _show_document_repository_tile:
+    st.session_state["task"] = None
+    st.rerun()
+if task in DISABLED_TASKS:
     st.session_state["task"] = None
     st.rerun()
 
