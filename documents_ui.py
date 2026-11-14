@@ -46,8 +46,9 @@ already private to one browser session/user, with an explicit
 """
 import hashlib
 import io
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 from PIL import Image
@@ -132,13 +133,70 @@ def _human_size(num_bytes) -> str:
     return f"{size:.1f} GB"  # pragma: no cover - unreachable, loop always returns first
 
 
+def _viewer_timezone() -> ZoneInfo | None:
+    """The viewer's browser time zone (st.context.timezone, an IANA
+    name like "America/New_York") as a ZoneInfo -- or None if it's
+    unavailable (always the case under AppTest, which has no real
+    browser to ask) or isn't a zone this installation recognizes.
+    Never raises -- every caller treats None as "fall back to UTC"."""
+    try:
+        tz_name = st.context.timezone
+    except Exception:
+        return None
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
 def _format_timestamp(iso_ts) -> str:
+    """Formats a stored UTC timestamp in the viewer's local time zone
+    (falling back to UTC if the browser's zone is unavailable or
+    unrecognized), with the zone abbreviation ("EST", "UTC", ...) from
+    strftime's %Z so it's always labeled, never ambiguous."""
     if not iso_ts:
         return "—"
     try:
-        return datetime.fromisoformat(iso_ts).strftime("%Y-%m-%d %H:%M UTC")
+        dt = datetime.fromisoformat(iso_ts)
     except ValueError:
         return str(iso_ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    tz = _viewer_timezone()
+    if tz is not None:
+        dt = dt.astimezone(tz)
+    return dt.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _resolve_date_filter_from(local_date: date, tz: ZoneInfo | None) -> str:
+    """The date_from value to send to the service layer for a
+    "from"-date the viewer picked: the exact UTC instant marking the
+    start of local_date in the viewer's time zone -- or, if tz is
+    None, the bare date itself (today's existing, unchanged behavior:
+    the service layer treats a bare date_from as the start of that
+    UTC day)."""
+    if tz is None:
+        return local_date.isoformat()
+    start = datetime(local_date.year, local_date.month, local_date.day, tzinfo=tz)
+    return start.astimezone(timezone.utc).isoformat()
+
+
+def _resolve_date_filter_to(local_date: date, tz: ZoneInfo | None) -> str:
+    """The date_to value to send to the service layer for a "to"-date
+    the viewer picked: the exact UTC instant marking the start of the
+    day AFTER local_date in the viewer's time zone -- the exclusive
+    bound covering all of local_date, even across a DST transition
+    where that day is 23 or 25 hours long -- or, if tz is None, the
+    bare date itself (today's existing, unchanged behavior: the
+    service layer treats a bare date_to as inclusive of that whole UTC
+    day)."""
+    if tz is None:
+        return local_date.isoformat()
+    next_day = local_date + timedelta(days=1)
+    end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=tz)
+    return end.astimezone(timezone.utc).isoformat()
 
 
 def _secrets_getter():
@@ -431,8 +489,9 @@ def _render_filters_and_table(actor_email: str, selected_category: int | None, s
             date_to = st.date_input("Uploaded to", value=None, key="doc_repo_date_to")
 
     file_type_value = None if file_type == "Any" else file_type
-    date_from_value = date_from.isoformat() if date_from else None
-    date_to_value = date_to.isoformat() if date_to else None
+    viewer_tz = _viewer_timezone()
+    date_from_value = _resolve_date_filter_from(date_from, viewer_tz) if date_from else None
+    date_to_value = _resolve_date_filter_to(date_to, viewer_tz) if date_to else None
     filters_active = bool(search.strip() or file_type_value or date_from_value or date_to_value)
 
     filter_signature = (selected_category, search, file_type_value, date_from_value, date_to_value, show_archived)
@@ -1291,8 +1350,9 @@ def _render_admin_audit_log(actor_email: str, secrets_getter) -> None:
     with col_to:
         date_to = st.date_input("To", value=None, key="doc_repo_admin_audit_date_to")
 
-    date_from_value = date_from.isoformat() if date_from else None
-    date_to_value = date_to.isoformat() if date_to else None
+    viewer_tz = _viewer_timezone()
+    date_from_value = _resolve_date_filter_from(date_from, viewer_tz) if date_from else None
+    date_to_value = _resolve_date_filter_to(date_to, viewer_tz) if date_to else None
 
     filter_signature = (actor_filter, action_filter, date_from_value, date_to_value)
     if st.session_state.get("_doc_repo_admin_audit_last_filter_sig") != filter_signature:

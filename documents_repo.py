@@ -1306,6 +1306,49 @@ def _check_list_documents_access(conn, actor_email: str, is_admin: bool, categor
         _deny(conn, actor_email, action, category_id=category_id, detail="archived")
 
 
+def _resolve_date_filter_bound(value: str, *, is_upper_bound: bool) -> str:
+    """Normalizes a date_from/date_to filter value into something
+    directly, lexicographically comparable against this module's
+    stored timestamp columns (created_at, ts -- always full UTC
+    ISO-8601 strings, see _now()). Shared by _list_documents_filter()
+    and _list_audit_log_filter(), so list_documents()/count_documents()
+    and list_audit_log()/count_audit_log() all accept the same two
+    input shapes the same way.
+
+    Accepts either:
+    - A bare calendar date ("2026-11-13") -- the original, unchanged
+      behavior: a whole UTC calendar day. Used as-is for a lower bound
+      (an ISO date string already sorts correctly as a lexicographic
+      prefix of any timestamp on that day); advanced by one UTC day
+      for an upper bound, so the comparison still includes every
+      moment of that day and nothing from the day after.
+    - A full ISO-8601 timestamp WITH a UTC offset
+      ("2026-11-13T05:00:00-05:00", or a "...Z" suffix) -- an exact
+      instant, normalized to UTC and used exactly as given. The caller
+      (documents_ui.py, converting a viewer's local calendar day) is
+      responsible for already passing the correct boundary: inclusive
+      for date_from, exclusive for date_to. is_upper_bound has no
+      effect on this path -- no day is added, since the caller already
+      picked the exact instant it wants.
+
+    Raises ValueError for a timestamp with no UTC offset (this module
+    never guesses a time zone for an ambiguous, naive value) or for a
+    value that parses as neither a bare date nor a timestamp.
+    """
+    try:
+        bare_date = date.fromisoformat(value)
+    except ValueError:
+        bare_date = None
+    if bare_date is not None:
+        if is_upper_bound:
+            return (bare_date + timedelta(days=1)).isoformat()
+        return value
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None:
+        raise ValueError(f"Date filter {value!r} is not a bare date and has no UTC offset.")
+    return instant.astimezone(timezone.utc).isoformat()
+
+
 def _list_documents_filter(
     actor_email: str, is_admin: bool, category_id: int | None, search: str | None,
     file_type: str | None, date_from: str | None, date_to: str | None, status: str | None,
@@ -1349,16 +1392,10 @@ def _list_documents_filter(
         params.append(file_type.lower().lstrip("."))
     if date_from:
         clauses.append("d.created_at >= ?")
-        params.append(date_from)
+        params.append(_resolve_date_filter_bound(date_from, is_upper_bound=False))
     if date_to:
-        # created_at is a full timestamp (see _now()), e.g.
-        # "2026-11-13T21:21:23+00:00" -- a plain "<= date_to" would
-        # exclude every row created later in date_to's own day, since
-        # any such timestamp sorts AFTER the bare date string. Compare
-        # against the start of the following day instead, same fix as
-        # _list_audit_log_filter()'s date_to.
         clauses.append("d.created_at < ?")
-        params.append((date.fromisoformat(date_to) + timedelta(days=1)).isoformat())
+        params.append(_resolve_date_filter_bound(date_to, is_upper_bound=True))
     return clauses, params
 
 
@@ -1386,14 +1423,23 @@ def list_documents(
     'archived' for only archived). search escapes % and _ so they're
     matched literally rather than as LIKE wildcards.
 
-    date_from/date_to are calendar-day bounds (e.g. "2026-11-13") on
-    created_at, both inclusive of every row anywhere in that whole day
-    -- not a literal string comparison against the bound you passed.
-    created_at is a full timestamp (see _now()), so "created_at >=
-    date_from" alone already includes that whole day; date_to instead
-    compares "created_at < date_to + 1 day" so it includes every
-    moment of its own day and nothing from the day after (same
-    approach as list_audit_log()'s date_to).
+    date_from/date_to each accept either of two shapes (see
+    _resolve_date_filter_bound()):
+    - A bare calendar date ("2026-11-13"): a whole UTC calendar day,
+      both bounds inclusive of every row anywhere in that day -- not a
+      literal string comparison against the bound you passed.
+      created_at is a full timestamp (see _now()), so "created_at >=
+      date_from" alone already includes that whole day; date_to
+      instead compares "created_at < date_to + 1 day" so it includes
+      every moment of its own day and nothing from the day after (same
+      approach as list_audit_log()'s date_to).
+    - A full ISO-8601 timestamp with a UTC offset
+      ("2026-11-13T05:00:00-05:00", or a "...Z" suffix): an exact
+      instant, normalized to UTC and compared as given -- date_from
+      inclusive, date_to EXCLUSIVE. Meant for a caller (documents_ui.py)
+      converting a viewer's local calendar day to the exact UTC
+      instants bounding it, so "today" means the viewer's local today,
+      not UTC's.
 
     A category_id scoped to a category actor_email can't see raises
     PermissionDenied; an unscoped call instead just silently narrows to
@@ -1454,7 +1500,10 @@ def count_documents(
     fact the exact same filter-building and access-check code, factored
     out into _list_documents_filter()/_check_list_documents_access() so
     the two can never silently disagree -- but returns just a row
-    count. Meant for places (like the category list's per-category
+    count. date_from/date_to accept the same two shapes list_documents()
+    does (a bare calendar date, or a full ISO-8601 timestamp with a UTC
+    offset -- see its docstring and _resolve_date_filter_bound()).
+    Meant for places (like the category list's per-category
     counts) that only need a number: calling list_documents() with a
     huge page_size just to take len() of the result means fetching and
     deserializing every row's full metadata for nothing.
@@ -1597,19 +1646,28 @@ def list_audit_log(
     matches (LIKE, with % and _ escaped so they're matched literally,
     same as list_documents()'s search).
 
-    date_from/date_to are calendar-day bounds (e.g. "2026-11-13"),
-    both inclusive of every row anywhere in that whole day -- not a
-    literal string comparison against the bound you passed. ts itself
-    is stored as a full UTC timestamp (see _now()), e.g.
-    "2026-11-13T21:21:23+00:00": a bare date string like "2026-11-13"
-    is already a lexicographic prefix of every timestamp on that day,
-    so "ts >= date_from" alone already includes that whole day with no
-    further adjustment needed. The upper bound does need one: a plain
-    "ts <= date_to" would exclude every row on date_to's own day
-    (any real timestamp "2026-11-13T..." sorts AFTER the bare string
-    "2026-11-13"), so this instead compares "ts < date_to + 1 day",
-    which includes every moment of date_to's day and nothing from the
-    day after.
+    date_from/date_to each accept either of two shapes (see
+    _resolve_date_filter_bound()):
+    - A bare calendar date ("2026-11-13"): both bounds inclusive of
+      every row anywhere in that whole UTC day -- not a literal string
+      comparison against the bound you passed. ts itself is stored as
+      a full UTC timestamp (see _now()), e.g.
+      "2026-11-13T21:21:23+00:00": a bare date string like
+      "2026-11-13" is already a lexicographic prefix of every
+      timestamp on that day, so "ts >= date_from" alone already
+      includes that whole day with no further adjustment needed. The
+      upper bound does need one: a plain "ts <= date_to" would exclude
+      every row on date_to's own day (any real timestamp
+      "2026-11-13T..." sorts AFTER the bare string "2026-11-13"), so
+      this instead compares "ts < date_to + 1 day", which includes
+      every moment of date_to's day and nothing from the day after.
+    - A full ISO-8601 timestamp with a UTC offset
+      ("2026-11-13T05:00:00-05:00", or a "...Z" suffix): an exact
+      instant, normalized to UTC and compared as given -- date_from
+      inclusive, date_to EXCLUSIVE. Meant for a caller (documents_ui.py)
+      converting a viewer's local calendar day to the exact UTC
+      instants bounding it, so "today" in the Audit Log means the
+      viewer's local today, not UTC's.
 
     Reading the log is not itself audited -- same as browsing
     documents via list_documents() isn't -- but a denial is, like
@@ -1651,10 +1709,10 @@ def _list_audit_log_filter(
         params.append(f"%{_escape_like(action_filter.strip())}%")
     if date_from:
         clauses.append("ts >= ?")
-        params.append(date_from)
+        params.append(_resolve_date_filter_bound(date_from, is_upper_bound=False))
     if date_to:
         clauses.append("ts < ?")
-        params.append((date.fromisoformat(date_to) + timedelta(days=1)).isoformat())
+        params.append(_resolve_date_filter_bound(date_to, is_upper_bound=True))
     return clauses, params
 
 
@@ -1670,6 +1728,9 @@ def count_audit_log(
     """Same filters/authorization as list_audit_log() (admin only), but
     a row count instead of rows -- for a "Showing X of N" caption next
     to the audit log's pagination without fetching every row.
+    date_from/date_to accept the same two shapes list_audit_log() does
+    (a bare calendar date, or a full ISO-8601 timestamp with a UTC
+    offset -- see its docstring and _resolve_date_filter_bound()).
     """
     actor_email = _require_actor(actor_email)
     conn = get_conn(db_path)

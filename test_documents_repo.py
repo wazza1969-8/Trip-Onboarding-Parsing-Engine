@@ -926,6 +926,74 @@ class BrowseDateFilterTests(TempDbTestCase):
         count = dr.count_documents(ADMIN, date_from="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
         self.assertEqual(count, 0)
 
+    # -----------------------------------------------------------------
+    # A full ISO-8601 timestamp WITH a UTC offset: an exact instant,
+    # not a whole UTC day -- date_from inclusive, date_to EXCLUSIVE.
+    # This is what documents_ui.py now sends after converting a
+    # viewer's local calendar day to UTC.
+    # -----------------------------------------------------------------
+    def test_timestamp_date_from_is_inclusive_of_the_exact_instant(self):
+        self._insert_document_with_created_at("2026-11-13T05:00:00+00:00")
+        results = dr.list_documents(ADMIN, date_from="2026-11-13T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+        count = dr.count_documents(ADMIN, date_from="2026-11-13T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_timestamp_date_from_excludes_an_instant_one_second_earlier(self):
+        self._insert_document_with_created_at("2026-11-13T04:59:59+00:00")
+        results = dr.list_documents(ADMIN, date_from="2026-11-13T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+        count = dr.count_documents(ADMIN, date_from="2026-11-13T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 0)
+
+    def test_timestamp_date_to_excludes_the_exact_instant_itself(self):
+        # Exclusive, unlike a bare date_to: a document created exactly
+        # AT the boundary instant is not included.
+        self._insert_document_with_created_at("2026-11-14T05:00:00+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-14T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+        count = dr.count_documents(ADMIN, date_to="2026-11-14T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 0)
+
+    def test_timestamp_date_to_includes_an_instant_one_second_earlier(self):
+        self._insert_document_with_created_at("2026-11-14T04:59:59+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-14T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+        count = dr.count_documents(ADMIN, date_to="2026-11-14T05:00:00+00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(count, 1)
+
+    def test_timestamp_with_non_utc_offset_is_normalized_before_comparing(self):
+        # "2026-11-13T23:30:00-05:00" is "2026-11-14T04:30:00+00:00" in
+        # UTC -- a document created one UTC minute later must still be
+        # excluded by a date_to of that instant.
+        self._insert_document_with_created_at("2026-11-14T04:30:01+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-13T23:30:00-05:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+        self._insert_document_with_created_at("2026-11-14T04:29:59+00:00")
+        results = dr.list_documents(ADMIN, date_to="2026-11-13T23:30:00-05:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(results), 1)
+
+    def test_us_eastern_evening_today_differs_from_utc_today(self):
+        # 7:30pm US-Eastern on Nov 13 is already Nov 14 in UTC. A
+        # viewer filtering for "today" (their local Nov 13) must still
+        # see this document -- the whole point of this feature.
+        doc_id = self._insert_document_with_created_at("2026-11-14T00:30:00+00:00")
+        # documents_ui.py would compute this exact date_to for a viewer
+        # in America/New_York filtering "Uploaded to" = 2026-11-13.
+        local_today_as_utc_bound = "2026-11-14T05:00:00+00:00"
+        results = dr.list_documents(ADMIN, date_to=local_today_as_utc_bound, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual([d["id"] for d in results], [doc_id])
+        # The old (still-supported) bare-UTC-day behavior would instead
+        # exclude it: "2026-11-13" as a bare date only covers UTC's own
+        # Nov 13, which ends at 2026-11-14T00:00:00+00:00 -- before this
+        # document's 00:30 UTC creation time.
+        results = dr.list_documents(ADMIN, date_to="2026-11-13", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(results, [])
+
+    def test_naive_timestamp_without_utc_offset_raises(self):
+        with self.assertRaises(ValueError):
+            dr.list_documents(ADMIN, date_from="2026-11-13T05:00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
+
 
 # ---------------------------------------------------------------------------
 # count_documents(): same filters/authorization as list_documents(), but a
@@ -1434,6 +1502,46 @@ class ListAuditLogTests(TempDbTestCase):
         )
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(r["ts"].startswith("2026-11-13") for r in rows))
+
+    # -----------------------------------------------------------------
+    # A full ISO-8601 timestamp WITH a UTC offset: an exact instant,
+    # not a whole UTC day -- same dual-format support as list_documents().
+    # -----------------------------------------------------------------
+    def test_timestamp_date_to_excludes_the_exact_instant_itself(self):
+        self._insert_audit_row("2026-11-14T05:00:00+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-14T05:00:00+00:00",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(rows, [])
+
+    def test_timestamp_date_to_includes_an_instant_one_second_earlier(self):
+        self._insert_audit_row("2026-11-14T04:59:59+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-14T05:00:00+00:00",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(len(rows), 1)
+
+    def test_us_eastern_evening_today_differs_from_utc_today(self):
+        # Same scenario as BrowseDateFilterTests -- a row from 7:30pm
+        # US-Eastern on Nov 13 (already Nov 14 in UTC) must still show
+        # up for a viewer filtering their own local "today".
+        self._insert_audit_row("2026-11-14T00:30:00+00:00")
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-14T05:00:00+00:00",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(len(rows), 1)
+        rows = dr.list_audit_log(
+            ADMIN, action_filter="synthetic_test_action", date_to="2026-11-13",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        self.assertEqual(rows, [])
+
+    def test_naive_timestamp_without_utc_offset_raises(self):
+        with self.assertRaises(ValueError):
+            dr.list_audit_log(ADMIN, date_from="2026-11-13T05:00:00", db_path=self.db_path, secrets_getter=self.secrets_getter)
 
 
 # ---------------------------------------------------------------------------

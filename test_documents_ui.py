@@ -68,14 +68,17 @@ unittest -- for _RUNNING_UNDER_TEST in app.py to correctly skip the
 real Okta/password gate. See app.py's own docstring for that flag.)
 """
 import io
+import os
 import sqlite3
 import struct
 import sys
+import tempfile
 import unittest
 import zipfile
 import zlib
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import documents_repo
 import documents_ui
@@ -306,6 +309,152 @@ class MarkdownEscapingTests(unittest.TestCase):
         for ch in "`*_{}[]()#+-.!|>~<":
             escaped = documents_ui._escape_markdown(f"a{ch}b")
             self.assertEqual(escaped, f"a\\{ch}b", msg=f"character {ch!r} was not escaped")
+
+
+class _FakeContext:
+    """Stands in for st.context in tests -- the real one needs a live
+    ScriptRunContext (a real browser round-trip) to report anything
+    but None, which AppTest can't simulate. Pure-function tests here
+    patch documents_ui.st.context with one of these instead."""
+
+    def __init__(self, timezone):
+        self.timezone = timezone
+
+
+class _RaisingContext:
+    """Stands in for st.context when even the property access itself
+    fails -- e.g. truly no ScriptRunContext at all."""
+
+    @property
+    def timezone(self):
+        raise RuntimeError("no script run context")
+
+
+class ViewerTimeZoneTests(unittest.TestCase):
+    """_viewer_timezone(), _format_timestamp(), and the local-day ->
+    UTC-bounds helpers -- all pure functions, so these patch
+    documents_ui.st.context directly rather than going through
+    AppTest (which has no way to simulate a real browser's reported
+    time zone at all; st.context.timezone is always None under it)."""
+
+    def test_valid_zone_name_resolves(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext("America/New_York")):
+            tz = documents_ui._viewer_timezone()
+        self.assertIsNotNone(tz)
+        self.assertEqual(str(tz), "America/New_York")
+
+    def test_invalid_zone_name_falls_back_to_none_without_raising(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext("Not/ARealZone")):
+            tz = documents_ui._viewer_timezone()
+        self.assertIsNone(tz)
+
+    def test_missing_zone_name_falls_back_to_none(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext(None)):
+            tz = documents_ui._viewer_timezone()
+        self.assertIsNone(tz)
+
+    def test_no_script_run_context_at_all_falls_back_to_none_without_raising(self):
+        with mock.patch.object(documents_ui.st, "context", _RaisingContext()):
+            tz = documents_ui._viewer_timezone()
+        self.assertIsNone(tz)
+
+    def test_format_timestamp_shows_viewer_zone_abbreviation(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext("America/New_York")):
+            # 2026-11-13T05:00:00+00:00 UTC is midnight EST (UTC-5).
+            formatted = documents_ui._format_timestamp("2026-11-13T05:00:00+00:00")
+        self.assertEqual(formatted, "2026-11-13 00:00 EST")
+
+    def test_format_timestamp_falls_back_to_utc_label_when_zone_unavailable(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext(None)):
+            formatted = documents_ui._format_timestamp("2026-11-13T05:00:00+00:00")
+        self.assertEqual(formatted, "2026-11-13 05:00 UTC")
+
+    def test_format_timestamp_falls_back_to_utc_label_for_invalid_zone(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext("Not/ARealZone")):
+            formatted = documents_ui._format_timestamp("2026-11-13T05:00:00+00:00")
+        self.assertEqual(formatted, "2026-11-13 05:00 UTC")
+
+    def test_format_timestamp_shows_dst_abbreviation_in_summer(self):
+        with mock.patch.object(documents_ui.st, "context", _FakeContext("America/New_York")):
+            # 2026-07-13T05:00:00+00:00 UTC is 01:00 EDT (UTC-4, DST).
+            formatted = documents_ui._format_timestamp("2026-07-13T05:00:00+00:00")
+        self.assertEqual(formatted, "2026-07-13 01:00 EDT")
+
+    # -------------------------------------------------------------
+    # Local calendar day -> exact UTC instant bounds
+    # -------------------------------------------------------------
+    def test_resolve_date_filter_from_converts_local_midnight_to_utc(self):
+        tz = ZoneInfo("America/New_York")
+        value = documents_ui._resolve_date_filter_from(date(2026, 11, 13), tz)
+        self.assertEqual(value, "2026-11-13T05:00:00+00:00")
+
+    def test_resolve_date_filter_to_converts_start_of_next_local_day_to_utc(self):
+        tz = ZoneInfo("America/New_York")
+        value = documents_ui._resolve_date_filter_to(date(2026, 11, 13), tz)
+        self.assertEqual(value, "2026-11-14T05:00:00+00:00")
+
+    def test_resolve_date_filter_from_falls_back_to_bare_date_without_zone(self):
+        value = documents_ui._resolve_date_filter_from(date(2026, 11, 13), None)
+        self.assertEqual(value, "2026-11-13")
+
+    def test_resolve_date_filter_to_falls_back_to_bare_date_without_zone(self):
+        value = documents_ui._resolve_date_filter_to(date(2026, 11, 13), None)
+        self.assertEqual(value, "2026-11-13")
+
+    def test_us_eastern_evening_local_today_differs_from_utc_today(self):
+        # 7:30pm US-Eastern on Nov 13 is already Nov 14 in UTC -- a
+        # viewer picking "Nov 13" as their local "today" must get a
+        # date_to bound that still covers that 7:30pm moment.
+        tz = ZoneInfo("America/New_York")
+        bound = documents_ui._resolve_date_filter_to(date(2026, 11, 13), tz)
+        seven_thirty_pm_eastern_in_utc = "2026-11-14T00:30:00+00:00"
+        self.assertLess(seven_thirty_pm_eastern_in_utc, bound)
+        # The UTC bare-date bound for "2026-11-13" would NOT cover it.
+        self.assertGreaterEqual(seven_thirty_pm_eastern_in_utc, "2026-11-14")
+
+    def test_dst_spring_forward_day_is_23_hours(self):
+        # 2026-03-08 is the US DST start date -- clocks skip 2am-3am,
+        # so local midnight-to-midnight only spans 23 UTC hours.
+        tz = ZoneInfo("America/New_York")
+        start = documents_ui._resolve_date_filter_from(date(2026, 3, 8), tz)
+        end = documents_ui._resolve_date_filter_to(date(2026, 3, 8), tz)
+        span = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+        self.assertEqual(span, timedelta(hours=23))
+
+    def test_dst_fall_back_day_is_25_hours(self):
+        # 2026-11-01 is the US DST end date -- clocks repeat 1am-2am,
+        # so local midnight-to-midnight spans 25 UTC hours.
+        tz = ZoneInfo("America/New_York")
+        start = documents_ui._resolve_date_filter_from(date(2026, 11, 1), tz)
+        end = documents_ui._resolve_date_filter_to(date(2026, 11, 1), tz)
+        span = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+        self.assertEqual(span, timedelta(hours=25))
+
+    def test_dst_transition_day_still_correctly_bounds_a_document(self):
+        # A document created at 1:30am EDT on 2026-11-01 -- during the
+        # repeated hour -- must still be found when filtering for that
+        # local day, through the full list_documents() call. Uses its
+        # own temp DB rather than the shared DEFAULT_DB_PATH, since
+        # this class has no per-test table-clearing setUp/tearDown.
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            tz = ZoneInfo("America/New_York")
+            date_from = documents_ui._resolve_date_filter_from(date(2026, 11, 1), tz)
+            date_to = documents_ui._resolve_date_filter_to(date(2026, 11, 1), tz)
+            cat_id = documents_repo.create_category(ADMIN_EMAIL, "DST Day", db_path=db_path, secrets_getter=admin_secrets_getter)
+            doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "DST Doc", PDF_BYTES, "a.pdf", db_path=db_path, secrets_getter=admin_secrets_getter)
+            conn = sqlite3.connect(db_path)
+            conn.execute("UPDATE documents SET created_at = ? WHERE id = ?", ("2026-11-01T05:30:00+00:00", doc_id))
+            conn.commit()
+            conn.close()
+            results = documents_repo.list_documents(
+                ADMIN_EMAIL, category_id=cat_id, date_from=date_from, date_to=date_to,
+                db_path=db_path, secrets_getter=admin_secrets_getter,
+            )
+            self.assertEqual([d["id"] for d in results], [doc_id])
+        finally:
+            os.remove(db_path)
 
 
 @unittest.skipUnless(_APPTEST_AVAILABLE, "streamlit.testing.v1.AppTest not available")
@@ -617,6 +766,35 @@ class DocumentRepositoryUITests(unittest.TestCase):
         self.assertFalse(at.exception)
         all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
         self.assertIn("Uploaded Today", all_titles)
+
+    def test_browse_shows_upload_time_in_viewers_zone_and_filters_by_local_day(self):
+        # End-to-end: a real browser timezone (mocked, since AppTest
+        # has no way to simulate one) changes both the displayed
+        # "Uploaded" time and what "today" means for the date filter.
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "TZ End To End", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(
+            ADMIN_EMAIL, cat_id, "Evening Upload", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter,
+        )
+        # 2026-11-14T00:30:00+00:00 UTC is 7:30pm EST on 2026-11-13.
+        conn = sqlite3.connect(documents_repo.DEFAULT_DB_PATH)
+        conn.execute("UPDATE document_versions SET uploaded_at = ?", ("2026-11-14T00:30:00+00:00",))
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(documents_ui.st, "context", _FakeContext("America/New_York")):
+            at = self._at_as(ADMIN_EMAIL)
+            at = self._select_document_repository(at)
+            self.assertFalse(at.exception)
+            uploaded_cells = [v for df in at.dataframe if "Uploaded" in df.value.columns for v in df.value["Uploaded"]]
+            self.assertIn("2026-11-13 19:30 EST", uploaded_cells)
+
+            # Filtering "Uploaded to" = 2026-11-13 (the viewer's local
+            # today) must still include this document, even though its
+            # UTC timestamp is already on 2026-11-14.
+            at.date_input(key="doc_repo_date_to").set_value(date(2026, 11, 13)).run(timeout=30)
+            self.assertFalse(at.exception)
+            all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
+            self.assertIn("Evening Upload", all_titles)
 
     def test_prepare_download_then_download_button_appears(self):
         cat_id = documents_repo.create_category(ADMIN_EMAIL, "Download Test", secrets_getter=admin_secrets_getter)
