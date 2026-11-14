@@ -430,6 +430,20 @@ def render_document_repository(actor_email: str) -> None:
 # Left column: category list with counts
 # ---------------------------------------------------------------------------
 def _render_category_list(actor_email: str, categories: list[dict], secrets_getter) -> int | None:
+    # A successful "Move to category" (below) wants to switch this
+    # filter to the destination -- but st.session_state for an
+    # existing widget key can't be reassigned once that widget has
+    # been instantiated this run (Streamlit raises
+    # StreamlitWidgetAlreadyInstantiatedError), and the move happens
+    # much later in the render, inside the detail panel. So it leaves
+    # the destination in this separate, non-widget key instead, and
+    # this applies it here, before the radio below is created on the
+    # very next rerun -- the one place in the script where it's still
+    # safe to do.
+    pending_key = "_doc_repo_pending_category_filter"
+    if pending_key in st.session_state:
+        st.session_state["doc_repo_selected_category"] = st.session_state.pop(pending_key)
+
     st.markdown("**Categories**")
 
     counts_key = f"_doc_repo_category_counts::{actor_email}"
@@ -735,6 +749,7 @@ def _render_detail_panel(actor_email: str, docs: list[dict], categories_by_id: d
             _render_replace_and_edit(actor_email, selected_doc_id, detail, secrets_getter)
         if can_manage:
             _render_archive_restore(actor_email, selected_doc_id, is_archived, secrets_getter)
+            _render_move_to_category(actor_email, selected_doc_id, category_id, secrets_getter)
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +850,74 @@ def _render_archive_restore(actor_email: str, doc_id: str, is_archived: bool, se
                 st.error("Couldn't archive this document right now.")
     with col_no:
         if st.button("Cancel", key=f"doc_repo_cancel_archive_btn::{doc_id}"):
+            st.session_state.pop(confirm_key, None)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Detail panel: Move to category (manage-level or admin, same bar as
+# Archive/Restore)
+# ---------------------------------------------------------------------------
+def _render_move_to_category(actor_email: str, doc_id: str, category_id: int, secrets_getter) -> None:
+    try:
+        candidates = documents_repo.categories_with_min_level(
+            actor_email, documents_repo.LEVEL_MANAGE, secrets_getter=secrets_getter,
+        )
+    except Exception:
+        st.error("Couldn't load categories to move this document to right now.")
+        return
+    # categories_with_min_level() returns every category for an admin,
+    # active or not (see its own docstring) -- the destination list
+    # must only offer active ones, so that filter happens here, not
+    # just by relying on what the function already does for everyone
+    # else.
+    destinations = [c for c in candidates if c["is_active"] and c["id"] != category_id]
+    if not destinations:
+        st.caption("No other category available to move this document to.")
+        return
+
+    destination_names = {c["id"]: c["name"] for c in destinations}
+    selected_dest = st.selectbox(
+        "Move to category", list(destination_names), format_func=lambda cid: destination_names[cid],
+        key=f"doc_repo_move_dest::{doc_id}",
+    )
+
+    confirm_key = f"_doc_repo_confirm_move::{doc_id}"
+    if not st.session_state.get(confirm_key):
+        if st.button("Move", key=f"doc_repo_move_btn::{doc_id}"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.warning(f"Move this document to {_escape_markdown(destination_names[selected_dest])}?")
+    col_yes, col_no = st.columns(2)
+    with col_yes:
+        if st.button("Yes, move", key=f"doc_repo_confirm_move_btn::{doc_id}", type="primary"):
+            try:
+                documents_repo.move_document(actor_email, doc_id, selected_dest, secrets_getter=secrets_getter)
+                st.session_state.pop(confirm_key, None)
+                # Invalidate the cached per-category counts (both the
+                # old and new category's counts just changed) and
+                # switch the Browse filter to the destination -- the
+                # document is still selected, just now shown under its
+                # new category, rather than disappearing from a stale
+                # "source category" filter or leaving the detail panel
+                # empty.
+                st.session_state.pop(f"_doc_repo_category_counts::{actor_email}", None)
+                st.session_state["_doc_repo_pending_category_filter"] = selected_dest
+                st.toast("Moved.")
+                st.rerun()
+            except documents_repo.PermissionDenied as e:
+                st.session_state.pop(confirm_key, None)
+                st.error(_escape_markdown(str(e)))
+            except ValueError as e:
+                st.session_state.pop(confirm_key, None)
+                st.error(_escape_markdown(str(e)))
+            except Exception:
+                st.session_state.pop(confirm_key, None)
+                st.error("Couldn't move this document right now.")
+    with col_no:
+        if st.button("Cancel", key=f"doc_repo_cancel_move_btn::{doc_id}"):
             st.session_state.pop(confirm_key, None)
             st.rerun()
 

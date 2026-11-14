@@ -1292,6 +1292,79 @@ def restore_document(actor_email: str, document_id: str, db_path: Path = DEFAULT
         conn.close()
 
 
+def move_document(actor_email: str, document_id: str, new_category_id: int, db_path: Path = DEFAULT_DB_PATH, secrets_getter=None) -> None:
+    """Changes only which category a document belongs to -- versions,
+    blobs, title/description/keywords, and archived status/history are
+    all untouched. Safe regardless of status: storage_key (see
+    add_document()) is built from document_id/version_no/sha256 only,
+    never category_id, so no blob ever needs to move.
+
+    Requires admin, or manage-level access on BOTH the document's
+    current category and new_category_id -- a caller with manage on
+    only one side is denied (and that denial audited) exactly like any
+    other admin-only-or-manage-level function here; a denied caller
+    learns nothing about new_category_id, since this authorization
+    check always runs before new_category_id is even looked up. An
+    admin, or someone with manage on both categories, may move an
+    archived document too -- the same manage-level bar already covers
+    the "archived needs manage" rule list_documents() etc. use, so
+    there is no separate archived-specific check.
+
+    new_category_id must name an existing, active category or this
+    raises ValueError -- but only for an already-authorized caller; a
+    denied caller gets PermissionDenied first, before this check ever
+    runs. Moving a document to the category it is already in is a
+    no-op: no UPDATE, no audit row (the authorization check above
+    still runs first, so a caller without access is still denied even
+    for a same-category "move").
+    """
+    actor_email = _require_actor(actor_email)
+    conn = get_conn(db_path)
+    _set_row_factory(conn)
+    try:
+        doc = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+        if doc is None:
+            raise ValueError(f"No such document: {document_id}")
+        old_category_id = doc["category_id"]
+
+        is_admin = _is_admin(conn, actor_email, secrets_getter)
+        if not is_admin and not (
+            _has_level(conn, actor_email, old_category_id, LEVEL_MANAGE)
+            and _has_level(conn, actor_email, new_category_id, LEVEL_MANAGE)
+        ):
+            _deny(conn, actor_email, "move_document", document_id=document_id, category_id=old_category_id)
+
+        if new_category_id == old_category_id:
+            return
+
+        dest = conn.execute(
+            "SELECT name, is_active FROM doc_categories WHERE id = ?", (new_category_id,)
+        ).fetchone()
+        if dest is None:
+            raise ValueError(f"No such category: {new_category_id}")
+        if not dest["is_active"]:
+            raise ValueError(f"Category {dest['name']!r} is not active.")
+
+        old_category = conn.execute(
+            "SELECT name FROM doc_categories WHERE id = ?", (old_category_id,)
+        ).fetchone()
+        old_name = old_category["name"] if old_category else str(old_category_id)
+
+        now = _now()
+        conn.execute(
+            "UPDATE documents SET category_id = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+            (new_category_id, now, actor_email, document_id),
+        )
+        conn.commit()
+        _audit(
+            conn, actor_email, "move_document", document_id=document_id, category_id=new_category_id,
+            detail=f"{old_name} (#{old_category_id}) -> {dest['name']} (#{new_category_id})",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _check_list_documents_access(conn, actor_email: str, is_admin: bool, category_id: int | None, status: str | None, action: str) -> None:
     """Authorization shared by list_documents() and count_documents():
     an explicit category_id needs at least view access, and archived

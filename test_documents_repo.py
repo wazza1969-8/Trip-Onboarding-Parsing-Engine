@@ -474,6 +474,146 @@ class ArchiveRestoreTests(TempDbTestCase):
 
 
 # ---------------------------------------------------------------------------
+# move_document(): changes only category_id -- admin, or manage on BOTH
+# the source and destination category.
+# ---------------------------------------------------------------------------
+class MoveDocumentTests(TempDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.secrets_getter = admin_secrets()
+        self.source_id = dr.create_category(ADMIN, "Source", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.dest_id = dr.create_category(ADMIN, "Destination", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.doc_id = dr.add_document(
+            ADMIN, self.source_id, "Movable Doc", make_pdf(), "a.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+
+    def test_admin_can_move(self):
+        dr.move_document(ADMIN, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(detail["category_id"], self.dest_id)
+
+    def test_manage_on_both_categories_can_move(self):
+        dr.grant_category_access(ADMIN, self.source_id, MANAGER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.dest_id, MANAGER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.move_document(MANAGER, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        detail = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(detail["category_id"], self.dest_id)
+
+    def test_manage_on_source_only_is_denied(self):
+        dr.grant_category_access(ADMIN, self.source_id, MANAGER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(MANAGER, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_manage_on_destination_only_is_denied(self):
+        dr.grant_category_access(ADMIN, self.dest_id, MANAGER, dr.LEVEL_MANAGE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(MANAGER, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_contributor_is_denied(self):
+        dr.grant_category_access(ADMIN, self.source_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.dest_id, CONTRIBUTOR, dr.LEVEL_CONTRIBUTE, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(CONTRIBUTOR, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_viewer_is_denied(self):
+        dr.grant_category_access(ADMIN, self.source_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.grant_category_access(ADMIN, self.dest_id, VIEWER, dr.LEVEL_VIEW, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(VIEWER, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_denial_is_audited(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(OUTSIDER, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(len(audit_rows(self.db_path, "move_document_denied")), 1)
+
+    def test_denied_caller_learns_nothing_about_a_nonexistent_destination(self):
+        # Authorization runs before the destination is even looked up
+        # -- a denied caller gets the same PermissionDenied whether
+        # new_category_id is real, inactive, or doesn't exist at all.
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(OUTSIDER, self.doc_id, 999999, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_nonexistent_destination_rejected(self):
+        with self.assertRaises(ValueError):
+            dr.move_document(ADMIN, self.doc_id, 999999, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_inactive_destination_rejected(self):
+        dr.deactivate_category(ADMIN, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        with self.assertRaises(ValueError):
+            dr.move_document(ADMIN, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_same_category_move_is_a_no_op(self):
+        before = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.move_document(ADMIN, self.doc_id, self.source_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        after = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(before["updated_at"], after["updated_at"])
+        self.assertEqual(len(audit_rows(self.db_path, "move_document")), 0)
+
+    def test_same_category_move_still_denies_unauthorized_caller(self):
+        with self.assertRaises(dr.PermissionDenied):
+            dr.move_document(OUTSIDER, self.doc_id, self.source_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+    def test_move_preserves_versions_titles_and_archived_state(self):
+        dr.replace_document(ADMIN, self.doc_id, make_pdf(2000), "b.pdf", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.update_metadata(ADMIN, self.doc_id, description="Keep me", keywords="kw", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dr.archive_document(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        before = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+        dr.move_document(ADMIN, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        after = dr.get_document_detail(ADMIN, self.doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+
+        self.assertEqual(after["category_id"], self.dest_id)
+        self.assertEqual(after["title"], before["title"])
+        self.assertEqual(after["description"], before["description"])
+        self.assertEqual(after["keywords"], before["keywords"])
+        self.assertEqual(after["status"], dr.STATUS_ARCHIVED)
+        self.assertEqual(after["archived_at"], before["archived_at"])
+        self.assertEqual(after["archived_by"], before["archived_by"])
+        self.assertEqual(len(after["versions"]), 2)
+        self.assertEqual({v["id"] for v in after["versions"]}, {v["id"] for v in before["versions"]})
+
+    def test_move_does_not_change_download_bytes(self):
+        original_data = make_pdf()
+        doc_id = dr.add_document(
+            ADMIN, self.source_id, "Bytes Doc", original_data, "bytes.pdf",
+            db_path=self.db_path, secrets_getter=self.secrets_getter,
+        )
+        dr.move_document(ADMIN, doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        filename, mime_type, data = dr.download_version(ADMIN, doc_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(data, original_data)
+        self.assertEqual(filename, "bytes.pdf")
+
+    def test_move_updates_listing_membership(self):
+        dr.move_document(ADMIN, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        source_docs = dr.list_documents(ADMIN, category_id=self.source_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dest_docs = dr.list_documents(ADMIN, category_id=self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(source_docs, [])
+        self.assertEqual([d["id"] for d in dest_docs], [self.doc_id])
+
+    def test_move_updates_counts(self):
+        dr.move_document(ADMIN, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        source_count = dr.count_documents(ADMIN, category_id=self.source_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        dest_count = dr.count_documents(ADMIN, category_id=self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        self.assertEqual(source_count, 0)
+        self.assertEqual(dest_count, 1)
+
+    def test_audit_row_has_actor_action_document_and_old_new_category(self):
+        dr.move_document(ADMIN, self.doc_id, self.dest_id, db_path=self.db_path, secrets_getter=self.secrets_getter)
+        rows = dr.list_audit_log(ADMIN, action_filter="move_document", db_path=self.db_path, secrets_getter=self.secrets_getter)
+        matching = [r for r in rows if r["action"] == "move_document"]
+        self.assertEqual(len(matching), 1)
+        row = matching[0]
+        self.assertEqual(row["actor_email"], ADMIN)
+        self.assertEqual(row["document_id"], self.doc_id)
+        self.assertEqual(row["category_id"], self.dest_id)
+        self.assertIn("Source", row["detail"])
+        self.assertIn("Destination", row["detail"])
+        self.assertIn(f"#{self.source_id}", row["detail"])
+        self.assertIn(f"#{self.dest_id}", row["detail"])
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 security audit: closes denial-test gaps the audit found
 # (replace_document, update_metadata, restore_document, list_versions,
 # and get_document_detail's base view-level case had no DIRECT denial
@@ -1625,6 +1765,7 @@ _AUTHORIZATION_REVIEWED_FUNCTIONS = {
     "find_duplicate_by_sha256",  # view
     "add_document", "replace_document", "update_metadata",  # contribute
     "archive_document", "restore_document",  # manage
+    "move_document",  # admin, or manage on BOTH the source and destination category
     "get_document_detail", "list_versions",  # view, or manage if archived
     "download_version",  # view (current)/contribute (old), or manage if archived
 }

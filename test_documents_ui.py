@@ -1089,6 +1089,196 @@ class DocumentRepositoryUITests(unittest.TestCase):
         self.assertEqual(detail["status"], documents_repo.STATUS_ACTIVE)
 
     # -----------------------------------------------------------------
+    # Phase 6: "Move to category" (manage-level or admin, same bar as
+    # Archive/Restore)
+    # -----------------------------------------------------------------
+    def test_move_to_category_visible_for_admin(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Move Admin Source", secrets_getter=admin_secrets_getter)
+        documents_repo.create_category(ADMIN_EMAIL, "Move Admin Dest", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len([b for b in at.button if b.key == f"doc_repo_move_btn::{doc_id}"]), 1)
+
+    def test_move_to_category_visible_for_manage_level_user(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Move Manage Source", secrets_getter=admin_secrets_getter)
+        dest_id = documents_repo.create_category(ADMIN_EMAIL, "Move Manage Dest", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, dest_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len([b for b in at.button if b.key == f"doc_repo_move_btn::{doc_id}"]), 1)
+
+    def test_move_to_category_hidden_for_contributor(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Move Contributor", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, CONTRIBUTOR_EMAIL, documents_repo.LEVEL_CONTRIBUTE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, CONTRIBUTOR_EMAIL, documents_repo.ROLE_CONTRIBUTOR, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(CONTRIBUTOR_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len([b for b in at.button if b.key == f"doc_repo_move_btn::{doc_id}"]), 0)
+
+    def test_move_to_category_hidden_for_viewer(self):
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Move Viewer", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len([b for b in at.button if b.key == f"doc_repo_move_btn::{doc_id}"]), 0)
+
+    def test_move_to_category_hidden_for_viewer_even_with_forced_session_state(self):
+        # Visibility is recomputed fresh from get_access_level() every
+        # run, same as the Admin tab's own forced-session-state test --
+        # forcing plausible-looking "I'm allowed" state must have no
+        # effect.
+        cat_id = documents_repo.create_category(ADMIN_EMAIL, "Move Forced State", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, cat_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, cat_id, VIEWER_EMAIL, documents_repo.LEVEL_VIEW, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = AppTest.from_file("app.py")
+        at.secrets["DOC_REPO_ADMIN_EMAILS"] = ADMIN_EMAIL
+        at.secrets["DOC_REPO_ENABLED"] = "true"
+        at.session_state["_test_actor_email"] = VIEWER_EMAIL
+        at.session_state["is_admin"] = True
+        at.session_state["can_manage"] = True
+        at.run(timeout=30)
+        at.button(key="select_Document Repository").click().run(timeout=30)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len([b for b in at.button if b.key == f"doc_repo_move_btn::{doc_id}"]), 0)
+
+    def test_move_to_category_destination_excludes_categories_without_manage(self):
+        source_id = documents_repo.create_category(ADMIN_EMAIL, "Move Partial Source", secrets_getter=admin_secrets_getter)
+        allowed_dest_id = documents_repo.create_category(ADMIN_EMAIL, "Move Partial Allowed", secrets_getter=admin_secrets_getter)
+        documents_repo.create_category(ADMIN_EMAIL, "Move Partial Forbidden", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, source_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, source_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, allowed_dest_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        # No grant at all on "Move Partial Forbidden" -- it must not
+        # appear as a destination option.
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        # format_func displays the category NAME; .options reports the
+        # formatted (displayed) values, not the raw category ids.
+        options = at.selectbox(key=f"doc_repo_move_dest::{doc_id}").options
+        self.assertEqual(options, ["Move Partial Allowed"])
+
+    def test_move_destination_excludes_inactive_categories(self):
+        source_id = documents_repo.create_category(ADMIN_EMAIL, "Move Inactive Source", secrets_getter=admin_secrets_getter)
+        documents_repo.create_category(ADMIN_EMAIL, "Move Inactive Available", secrets_getter=admin_secrets_getter)
+        inactive_id = documents_repo.create_category(ADMIN_EMAIL, "Move Inactive Dest", secrets_getter=admin_secrets_getter)
+        documents_repo.deactivate_category(ADMIN_EMAIL, inactive_id, secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, source_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        options = at.selectbox(key=f"doc_repo_move_dest::{doc_id}").options
+        self.assertNotIn("Move Inactive Dest", options)
+        self.assertIn("Move Inactive Available", options)
+
+    def test_move_with_no_destination_available_shows_message_not_empty_dropdown(self):
+        source_id = documents_repo.create_category(ADMIN_EMAIL, "Move Lonely Source", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, source_id, "Movable", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+        documents_repo.grant_category_access(ADMIN_EMAIL, source_id, VIEWER_EMAIL, documents_repo.LEVEL_MANAGE, secrets_getter=admin_secrets_getter)
+        documents_repo.create_doc_user(ADMIN_EMAIL, VIEWER_EMAIL, documents_repo.ROLE_VIEWER, secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(VIEWER_EMAIL, enabled=True)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertEqual(len([b for b in at.selectbox if b.key == f"doc_repo_move_dest::{doc_id}"]), 0)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("No other category available to move this document to", captions)
+
+    def test_move_requires_confirmation_then_updates_listing_and_counts(self):
+        source_id = documents_repo.create_category(ADMIN_EMAIL, "Move E2E Source", secrets_getter=admin_secrets_getter)
+        dest_id = documents_repo.create_category(ADMIN_EMAIL, "Move E2E Dest", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, source_id, "Moving Doc", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        at.selectbox(key=f"doc_repo_move_dest::{doc_id}").set_value(dest_id).run(timeout=30)
+
+        # First click only asks for confirmation -- the document must
+        # still be in its original category.
+        at.button(key=f"doc_repo_move_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["category_id"], source_id)
+        warning_texts = " ".join(w.value for w in at.warning)
+        self.assertIn("Move this document to", warning_texts)
+
+        # Confirming actually moves it.
+        at.button(key=f"doc_repo_confirm_move_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["category_id"], dest_id)
+
+        # The category filter switched to the destination, and the
+        # document is still selected/visible there.
+        all_titles = [t for df in at.dataframe for t in df.value.get("Title", [])]
+        self.assertIn("Moving Doc", all_titles)
+        self.assertEqual(at.radio(key="doc_repo_selected_category").value, dest_id)
+
+    def test_cancel_move_leaves_document_in_source_category(self):
+        source_id = documents_repo.create_category(ADMIN_EMAIL, "Move Cancel Source", secrets_getter=admin_secrets_getter)
+        dest_id = documents_repo.create_category(ADMIN_EMAIL, "Move Cancel Dest", secrets_getter=admin_secrets_getter)
+        doc_id = documents_repo.add_document(ADMIN_EMAIL, source_id, "Not Moving", PDF_BYTES, "a.pdf", secrets_getter=admin_secrets_getter)
+
+        at = self._at_as(ADMIN_EMAIL)
+        at = self._select_document_repository(at)
+        at.selectbox(key="doc_repo_selected_doc_id").set_value(doc_id).run(timeout=30)
+        at.selectbox(key=f"doc_repo_move_dest::{doc_id}").set_value(dest_id).run(timeout=30)
+        at.button(key=f"doc_repo_move_btn::{doc_id}").click().run(timeout=30)
+        at.button(key=f"doc_repo_cancel_move_btn::{doc_id}").click().run(timeout=30)
+        self.assertFalse(at.exception)
+        detail = documents_repo.get_document_detail(ADMIN_EMAIL, doc_id, secrets_getter=admin_secrets_getter)
+        self.assertEqual(detail["category_id"], source_id)
+
+    # NOTE on the ValueError/PermissionDenied branches in
+    # _render_move_to_category()'s confirm handler: there is no
+    # realistic sequence of UI interactions that reaches them. The
+    # destination dropdown is rebuilt from categories_with_min_level()
+    # on every single rerun, so the exact same access change that
+    # would make move_document() raise (the destination deactivated,
+    # or the actor's manage access revoked on either category) always
+    # also removes that destination from the dropdown's own options
+    # first -- confirmed directly: forcing the destination selectbox's
+    # session_state to an option no longer in its rebuilt options list
+    # (whether via a real widget interaction or by writing to
+    # session_state directly before a run) makes Streamlit silently
+    # fall back to a still-valid option rather than ever passing the
+    # stale one through. These except branches are the same proven
+    # pattern used by _render_archive_restore()/_render_replace_and_edit()
+    # elsewhere in this file (which have no dedicated "error path" test
+    # either) -- real defense-in-depth against a genuine concurrent
+    # race between two sessions, which a single sequential AppTest run
+    # can't simulate, not a gap in this test suite.
+
+    # -----------------------------------------------------------------
     # Phase 3: "Show archived" toggle visibility and access scoping
     # -----------------------------------------------------------------
     def test_show_archived_toggle_hidden_for_viewer(self):
